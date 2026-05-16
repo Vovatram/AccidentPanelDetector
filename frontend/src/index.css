@@ -1,0 +1,101 @@
+@import "tailwindcss";
+:root {
+        --background: #ffffff;
+        --text: #333333;
+        --table-border: #e0e0e0;
+        --table-header: #4CAF50;
+        --table-header-text: #ffffff;
+        --card-bg: #f9f9f9;
+        --marquee-bg: #f0f0f0;
+        --shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        --button-bg: #4CAF50;
+        --button-text: #ffffff;
+        --fon : #dddddd;
+        --divc : #dddddd;
+        --divc2 : #cfcfcf;
+        
+    }
+
+    [data-theme="dark"] {
+        --background: #1a1a1a;
+        --text: #e0e0e0;
+        --table-border: #444444;
+        --table-header: #2a7a2e;
+        --table-header-text: #e0e0e0;
+        --card-bg: #333333;
+        --marquee-bg: #333333;
+        --shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        --button-bg: #2a7a2e;
+        --button-text: #e0e0e0;
+        --fon: #111530;
+        --divc: #464646;
+        --divc2 : #393b48;
+        
+    }
+.toggle-btn.open {
+    margin: 0 0 0 270px;
+    background-color: #ff0000;
+}
+
+.toggle-btn {
+  position: fixed;
+  top: 40px;
+  left: 16px;
+  width: 36px;
+  height: 36px;
+  background: #00aeff;
+  color: white;
+  border: none;
+  border-radius: 10px;
+  font-size: 18px;
+  cursor: pointer;
+  z-index: 10000;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.3s ease;
+  overflow: hidden;
+}
+.toggle-btn .icon {
+  position: absolute;
+  transition: all 0.3s ease;
+  font-size: 20px;
+}
+
+.toggle-btn .icon-menu {
+  transform: scale(1);
+  opacity: 1;
+}
+
+.toggle-btn .icon-close {
+  transform: scale(0) rotate(-180deg);
+  opacity: 0;
+}
+
+.toggle-btn.open .icon-menu {
+  transform: scale(0) rotate(180deg);
+  opacity: 0;
+}
+
+.toggle-btn.open .icon-close {
+  transform: scale(1) rotate(0deg);
+  opacity: 1;
+}
+.control-panel {
+  position: fixed;
+  top: 16px;
+  left: -300px;
+  width: 260px;
+  background: var(--background);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 18px;
+  z-index: 9999;
+  transition: left 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1px solid rgba(0,0,0,0.08);
+  backdrop-filter: blur(8px);
+}
+.control-panel.open {
+  left: 16px;
+}

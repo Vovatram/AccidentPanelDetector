@@ -57,8 +57,8 @@ CREATE TABLE superadmins (
 -- Новые столбцы:
 ALTER TABLE users     ADD COLUMN IF NOT EXISTS telegram VARCHAR(255);
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS mistake  JSONB NOT NULL DEFAULT '[]';
-
 git add .
+
 git commit --amend --no-edit  
 git push --force-with-lease origin main
 

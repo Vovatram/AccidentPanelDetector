@@ -175,13 +175,31 @@ function Camera() {
   const [toastMsg, setToastMsg]   = useState('');
   const [showToast, setShowToast] = useState(false);
 
+  // Управление потоком камеры
+  const [processCamera,      setProcessCamera]      = useState(true);
+  const [detectionSelected,  setDetectionSelected]  = useState([...DETECTABLE]);
+  const [isSuperAdmin,       setIsSuperAdmin]        = useState(false);
+  const [hasZones,           setHasZones]            = useState(false);
+
   // Ссылки на актуальные значения для замыканий WS
-  const siteSubsRef  = useRef(siteSubs);
-  const timeRangeRef = useRef(timeRange);
-  const isAuthRef    = useRef(isAuthenticated);
-  useEffect(()=>{ siteSubsRef.current  = siteSubs;      },[siteSubs]);
-  useEffect(()=>{ timeRangeRef.current = timeRange;     },[timeRange]);
-  useEffect(()=>{ isAuthRef.current    = isAuthenticated;},[isAuthenticated]);
+  const siteSubsRef      = useRef(siteSubs);
+  const timeRangeRef     = useRef(timeRange);
+  const isAuthRef        = useRef(isAuthenticated);
+  const processCameraRef = useRef(true);
+  const detectionRef     = useRef([...DETECTABLE]);
+  const displayRef       = useRef([...DETECTABLE]);
+  const videoReconnTimer = useRef(null);
+  // Флаг: подписки только что пришли с сервера, не отправлять update_subscriptions
+  const subsFromServerRef  = useRef(false);
+  // Реф для isSuperAdmin — чтобы читать актуальное значение в эффектах без лишних зависимостей
+  const isSuperAdminRef    = useRef(false);
+  useEffect(() => { isSuperAdminRef.current = isSuperAdmin; }, [isSuperAdmin]);
+  useEffect(()=>{ siteSubsRef.current      = siteSubs;         },[siteSubs]);
+  useEffect(()=>{ timeRangeRef.current     = timeRange;        },[timeRange]);
+  useEffect(()=>{ isAuthRef.current        = isAuthenticated;  },[isAuthenticated]);
+  useEffect(()=>{ processCameraRef.current = processCamera;    },[processCamera]);
+  useEffect(()=>{ detectionRef.current     = detectionSelected;},[detectionSelected]);
+  useEffect(()=>{ displayRef.current       = displaySelected;  },[displaySelected]);
 
   const T = {
     dark:  {bg:'bg-gray-900',text:'text-white',cardBg:'bg-gray-800',border:'border-gray-700',btn:'bg-gray-700 hover:bg-gray-600',input:'bg-gray-700 text-white border-gray-600'},
@@ -200,58 +218,146 @@ function Camera() {
     return keys.length === Object.keys(DISPLAY_TO_BACKEND).length ? ['all'] : keys;
   };
 
-  // ── Проверка токена + профиль ────────────────────────────────────────────
+  // ── Проверка токена + профиль + суперадмин ──────────────────────────────
   useEffect(() => {
     const token = localStorage.getItem('access_token');
     if (!token) return;
+    let email = '';
     try {
       const payload = JSON.parse(atob(token.split('.')[1]));
       if (payload.sub) {
+        email = payload.sub;
         setIsAuthenticated(true);
-        setUserEmail(payload.sub);
-        setUserName(payload.sub.split('@')[0]);
+        setUserEmail(email);
+        setUserName(email.split('@')[0]);
       }
     } catch {}
-    fetch('/user/profile', {headers:{Authorization:`Bearer ${token}`}})
+    fetch(`${import.meta.env.VITE_API_URL}/user/profile`, {headers:{Authorization:`Bearer ${token}`}})
       .then(r=>r.json())
       .then(d=>{ if(d.telegram) setUserTelegram(d.telegram); })
       .catch(()=>{});
+    if (email) {
+      fetch(`${import.meta.env.VITE_API_URL}/superadmins`)
+        .then(r=>r.json())
+        .then(admins=>{ if(admins.includes(email)) setIsSuperAdmin(true); })
+        .catch(()=>{});
+    }
   }, []);
 
-  // ── WS видеопотока ────────────────────────────────────────────────────────
+  // Загружаем зоны и текущее состояние детекции из БД
   useEffect(() => {
-    const loader = document.getElementById('loader');
-    const img    = document.getElementById('camera-img');
-    const ws     = new WebSocket('ws://localhost:8000/ws');
-    videoWsRef.current = ws;
+    fetch(`${import.meta.env.VITE_API_URL}/camera-zones?name=${encodeURIComponent(name)}`)
+      .then(r=>r.json())
+      .then(d=>{
+        const has = (d.road_zones?.length>0)||(d.stop_zones?.length>0)||(d.crosswalk_zones?.length>0);
+        setHasZones(has);
+        if (!isSuperAdmin) return;
+        // Инициализируем processCamera и detectionSelected из столбца incidents
+        const inc = d.incidents;
+        if (inc === false) {
+          setProcessCamera(false);
+        } else if (Array.isArray(inc) && inc.length > 0) {
+          setProcessCamera(true);
+          const displayNames = inc.map(k => BACKEND_TO_DISPLAY[k]).filter(Boolean);
+          if (displayNames.length) setDetectionSelected(displayNames);
+        }
+        // null → оставляем дефолт (всё включено)
+      })
+      .catch(()=>{});
+  }, [name, isSuperAdmin]);
+
+  // ── WS видеопотока с автопереподключением ────────────────────────────────
+  const connectVideoWs = useCallback(() => {
+    clearTimeout(videoReconnTimer.current);
+    if (videoWsRef.current) { videoWsRef.current.onclose = null; videoWsRef.current.close(); }
+    if (!processCameraRef.current) { setConnectionStatus('disconnected'); return; }
+
     setConnectionStatus('connecting');
+    const ws = new WebSocket('ws://localhost:8000/ws');
+    videoWsRef.current = ws;
+
     ws.onopen = () => {
-      ws.send(JSON.stringify({camera:name, filters:['all'],
-        display_filters:computeBackendFilters(displaySelected)}));
+      ws.send(JSON.stringify({
+        camera:          name,
+        filters:         computeBackendFilters(detectionRef.current),
+        display_filters: computeBackendFilters(displayRef.current),
+      }));
       setConnectionStatus('connected');
     };
     ws.onmessage = event => {
-      if (typeof event.data==='string') { if(event.data==='ping') ws.send('pong'); return; }
-      const blob = new Blob([event.data],{type:'image/jpeg'});
+      if (typeof event.data === 'string') { if (event.data === 'ping') ws.send('pong'); return; }
+      const blob = new Blob([event.data], {type:'image/jpeg'});
       const url  = URL.createObjectURL(blob);
-      img.src    = url;
+      const img  = document.getElementById('camera-img');
+      if (!img) return;
+      img.src = url;
       img.onload = () => {
-        if(loader) loader.style.display='none';
-        if(img.dataset.prev) URL.revokeObjectURL(img.dataset.prev);
+        const loader = document.getElementById('loader');
+        if (loader) loader.style.display = 'none';
+        if (img.dataset.prev) URL.revokeObjectURL(img.dataset.prev);
         img.dataset.prev = url;
       };
     };
-    ws.onerror  = () => setConnectionStatus('error');
-    ws.onclose  = () => setConnectionStatus('disconnected');
-    return () => { if(ws.readyState===WebSocket.OPEN) ws.close(); };
+    ws.onerror = () => setConnectionStatus('error');
+    ws.onclose = () => {
+      setConnectionStatus('disconnected');
+      if (processCameraRef.current) {
+        videoReconnTimer.current = setTimeout(connectVideoWs, WS_RECONNECT_DELAY);
+      }
+    };
   }, [name]);
 
   useEffect(() => {
+    connectVideoWs();
+    return () => {
+      clearTimeout(videoReconnTimer.current);
+      if (videoWsRef.current) { videoWsRef.current.onclose = null; videoWsRef.current.close(); }
+    };
+  }, [name]);
+
+  // вкл/выкл камеры + сохранение в БД (только суперадмин)
+  useEffect(() => {
+    if (!processCamera) {
+      clearTimeout(videoReconnTimer.current);
+      if (videoWsRef.current) { videoWsRef.current.onclose = null; videoWsRef.current.close(); }
+      setConnectionStatus('disconnected');
+    } else {
+      connectVideoWs();
+    }
+    if (!isSuperAdminRef.current) return;
+    const token = localStorage.getItem('access_token');
+    const incidents = processCamera
+      ? detectionRef.current.map(d => DISPLAY_TO_BACKEND[d]).filter(Boolean)
+      : false;
+    fetch(`${import.meta.env.VITE_API_URL}/camera-incidents`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', Authorization:`Bearer ${token}`},
+      body: JSON.stringify({name, incidents}),
+    }).catch(()=>{});
+  }, [processCamera, connectVideoWs, name]);
+
+  // обновить display_filters на лету
+  useEffect(() => {
     const ws = videoWsRef.current;
-    if (!ws || ws.readyState!==WebSocket.OPEN) return;
-    ws.send(JSON.stringify({type:'set_display_filters',
-      display_filters:computeBackendFilters(displaySelected)}));
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({type:'set_display_filters', display_filters:computeBackendFilters(displaySelected)}));
   }, [displaySelected]);
+
+  // обновить detection filters на лету (видео WS + сохранение в БД для суперадмина)
+  useEffect(() => {
+    const ws = videoWsRef.current;
+    if (ws?.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({type:'set_filters', filters:computeBackendFilters(detectionSelected)}));
+    // Сохраняем в БД только если суперадмин и камера включена
+    if (!isSuperAdminRef.current || !processCameraRef.current) return;
+    const token = localStorage.getItem('access_token');
+    const incidents = detectionSelected.map(d => DISPLAY_TO_BACKEND[d]).filter(Boolean);
+    fetch(`${import.meta.env.VITE_API_URL}/camera-incidents`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', Authorization:`Bearer ${token}`},
+      body: JSON.stringify({name, incidents}),
+    }).catch(()=>{});
+  }, [detectionSelected, name]);
 
   // ── WS уведомлений с автопереподключением ────────────────────────────────
   const connectNotifWs = useCallback(() => {
@@ -281,32 +387,49 @@ function Camera() {
 
         if (msg.type==='connected') {
           setIsAuthenticated(msg.authenticated);
-          // Обновляем подписки если пришли из БД (авторизован)
-          if (msg.authenticated && msg.subscriptions) setSiteSubs(msg.subscriptions);
+          if (msg.authenticated && msg.subscriptions) {
+            subsFromServerRef.current = true; // не отправлять update_subscriptions в ответ
+            setSiteSubs(msg.subscriptions);
+          }
+          if (msg.authenticated && msg.telegram_subscriptions != null)
+            setTelegramSubs(msg.telegram_subscriptions);
         }
 
-        if (msg.type==='incidents' && msg.incidents?.length) {
-          setIncidents(prev => {
-            const ids    = new Set(prev.map(x=>x.id));
-            const mapped = msg.incidents
-              .filter(i => !ids.has(i.id))
-              .map(i => ({
-                id:         i.id,
-                time:       fmtTime(i.date),
-                date:       fmtDate(i.date),
-                type:       i.notification_text,
-                severity:   i.severity,
-                screenshot: i.screenshot_name,
-              }));
-            if (!mapped.length) return prev;
-            // Новые инциденты в начало, потом старые — обрезаем до 200 последних по времени
-            const merged = [...mapped, ...prev];
-            // Сортируем по id desc (новые первые)
-            merged.sort((a,b) => b.id - a.id);
-            const isNew = mapped.some(m => !prev.find(p=>p.id===m.id));
-            if (isNew) setNewIncidentIndicator(true);
-            return merged.slice(0, 200);
-          });
+        if (msg.type==='incidents') {
+          const list = msg.incidents || [];
+          if (msg.reset) {
+            // Полная замена списка (после смены подписок или периода)
+            const mapped = list.map(i => ({
+              id:         i.id,
+              time:       fmtTime(i.date),
+              date:       fmtDate(i.date),
+              type:       i.notification_text,
+              severity:   i.severity,
+              screenshot: i.screenshot_name,
+            }));
+            mapped.sort((a,b) => b.id - a.id);
+            setIncidents(mapped.slice(0, 200));
+          } else if (list.length) {
+            setIncidents(prev => {
+              const ids    = new Set(prev.map(x=>x.id));
+              const mapped = list
+                .filter(i => !ids.has(i.id))
+                .map(i => ({
+                  id:         i.id,
+                  time:       fmtTime(i.date),
+                  date:       fmtDate(i.date),
+                  type:       i.notification_text,
+                  severity:   i.severity,
+                  screenshot: i.screenshot_name,
+                }));
+              if (!mapped.length) return prev;
+              const merged = [...mapped, ...prev];
+              merged.sort((a,b) => b.id - a.id);
+              const isNew = mapped.some(m => !prev.find(p=>p.id===m.id));
+              if (isNew) setNewIncidentIndicator(true);
+              return merged.slice(0, 200);
+            });
+          }
         }
 
         if (msg.type==='subscriptions_saved') toast('Подписки сохранены ✓');
@@ -337,14 +460,11 @@ function Camera() {
     };
   }, [name]);
 
-  // При смене siteSubs (авторизованный) сразу отправляем обновление
+  // Сбрасываем флаг subsFromServerRef когда siteSubs пришли с сервера
+  // (чтобы не дублировать update_subscriptions обратно на сервер)
   useEffect(() => {
-    if (!isAuthenticated) return;
-    const ws = notifWsRef.current;
-    if (ws?.readyState===WebSocket.OPEN) {
-      ws.send(JSON.stringify({type:'update_subscriptions', subscriptions:siteSubs}));
-    }
-  }, [siteSubs, isAuthenticated]);
+    if (subsFromServerRef.current) { subsFromServerRef.current = false; }
+  }, [siteSubs]);
 
   const sendTimeRangeUpdate = newTr => {
     setTimeRange(newTr);
@@ -358,7 +478,7 @@ function Camera() {
     const token = localStorage.getItem('access_token');
     if (!token) return;
     try {
-      const res = await fetch('/user/telegram', {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/user/telegram`, {
         method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${token}`},
         body: JSON.stringify({telegram: username.replace(/^@/,'')})
       });
@@ -368,8 +488,37 @@ function Camera() {
 
 
 
-  const saveSiteSubs = newSubs => {
-    setSiteSubs(newSubs); // useEffect выше отправит обновление
+  const saveSiteSubs = async (newSubs) => {
+    setSiteSubs(newSubs);
+    setOpenChannel(null);
+    const token = localStorage.getItem('access_token');
+    if (!token) return;
+    // HTTP-сохранение — гарантированно попадает в БД
+    try {
+      await fetch(`${import.meta.env.VITE_API_URL}/user/site-notifications`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json', Authorization:`Bearer ${token}`},
+        body: JSON.stringify({camera: name, subscriptions: newSubs}),
+      });
+    } catch {}
+    // WS-обновление — обновляет in-memory фильтр и перезагружает историю
+    const ws = notifWsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({type:'update_subscriptions', subscriptions: newSubs}));
+    }
+  };
+
+  const saveTelegramSubs = async (subs) => {
+    const token = localStorage.getItem('access_token');
+    if (!token) return;
+    try {
+      await fetch(`${import.meta.env.VITE_API_URL}/user/telegram-subscriptions`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json', Authorization:`Bearer ${token}`},
+        body: JSON.stringify({camera: name, subscriptions: subs}),
+      });
+      toast('Telegram-подписки сохранены ✓');
+    } catch { toast('Ошибка сохранения'); }
     setOpenChannel(null);
   };
 
@@ -425,7 +574,7 @@ function Camera() {
         <div className="flex items-center justify-between px-4 py-2 gap-3">
           {/* Левая часть */}
           <div className="flex items-center gap-2">
-            <button onClick={()=>navigate(-1)}
+            <button onClick={()=>navigate('/map')}
               className={`w-9 h-9 rounded-full ${T.btn} flex items-center justify-center text-lg hover:scale-105 transition-all`}>←</button>
             <button onClick={()=>navigate(`/statistics/${encodeURIComponent(name)}`)}
               className={`w-9 h-9 rounded-full ${T.btn} flex items-center justify-center hover:scale-105 transition-all`}
@@ -501,22 +650,61 @@ function Camera() {
 
       {/* ── Панель изображения ── */}
       {activePanel==='imageControls'&&(
-        <div className={`fixed right-4 top-16 z-20 w-72 ${T.cardBg} rounded-lg shadow-xl border ${T.border} animate-slide-in-right`}>
+        <div className={`fixed right-4 top-16 z-20 w-72 ${T.cardBg} rounded-lg shadow-xl border ${T.border} animate-slide-in-right overflow-y-auto`}
+             style={{maxHeight:'calc(100vh - 5rem)'}}>
           <div className="flex justify-between items-center p-3 border-b">
             <h3 className="font-semibold text-sm">🖼️ Изображение</h3>
             <button onClick={()=>setActivePanel(null)} className="hover:opacity-70">✕</button>
           </div>
           <div className="p-3 space-y-3">
+
+            {/* Мастер-кнопка — только суперадмин с настроенными зонами */}
+            {isSuperAdmin&&(
+              <button onClick={()=>setProcessCamera(p=>!p)}
+                className={`w-full py-2 rounded text-sm font-semibold transition-colors ${
+                  processCamera ? 'bg-green-700 hover:bg-green-600 text-white'
+                                : 'bg-gray-600 hover:bg-gray-500 text-gray-300'
+                }`}>
+                {processCamera ? '🟢 Обрабатывать камеру' : '⚫ Камера отключена'}
+              </button>
+            )}
+
+            {/* Зум */}
             <div className="flex gap-2">
               <button onClick={zoomIn}    className={`flex-1 py-1.5 rounded ${T.btn} text-sm`}>➕</button>
               <button onClick={zoomOut}   className={`flex-1 py-1.5 rounded ${T.btn} text-sm`}>➖</button>
               <button onClick={resetZoom} className={`flex-1 py-1.5 rounded ${T.btn} text-sm`}>⟲</button>
             </div>
             <div className="text-center text-xs opacity-60">Масштаб: {Math.round(scale*100)}%</div>
+
+            {/* Обнаруживать — только суперадмин с настроенными зонами */}
+            {isSuperAdmin&&(
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-sm font-semibold">Обнаруживать:</span>
+                  <button onClick={()=>setDetectionSelected(detectionSelected.length===DETECTABLE.length?[]:[...DETECTABLE])}
+                    className="text-xs text-indigo-400 hover:text-indigo-300">
+                    {detectionSelected.length===DETECTABLE.length?'Снять все':'Все'}
+                  </button>
+                </div>
+                <div className="space-y-1 p-2 rounded border border-gray-600">
+                  {DETECTABLE.map(type=>(
+                    <label key={type} className="flex items-center gap-2 cursor-pointer text-sm hover:bg-gray-700 px-1 py-0.5 rounded">
+                      <input type="checkbox" checked={detectionSelected.includes(type)}
+                        onChange={()=>setDetectionSelected(prev=>prev.includes(type)?prev.filter(x=>x!==type):[...prev,type])}
+                        className="accent-indigo-500"/>
+                      <span className="text-xs">{type}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Отображать */}
             <div>
               <div className="flex items-center justify-between mb-1">
-                <span className="text-sm font-semibold">Обводки:</span>
-                <button onClick={()=>setDisplaySelected(displaySelected.length===DETECTABLE.length?[]: [...DETECTABLE])}
+                <span className="text-sm font-semibold">Отображать:</span>
+                <button onClick={()=>setDisplaySelected(displaySelected.length===DETECTABLE.length?[]:[...DETECTABLE])}
                   className="text-xs text-indigo-400 hover:text-indigo-300">
                   {displaySelected.length===DETECTABLE.length?'Снять все':'Все'}
                 </button>
@@ -531,9 +719,13 @@ function Camera() {
                   </label>
                 ))}
               </div>
-              <p className="text-xs opacity-40 mt-1">Детекция продолжается всегда</p>
             </div>
-            <button onClick={()=>navigate(`/camera/${name}/zones`)} className={`w-full py-1.5 rounded ${T.btn} text-sm`}>⚙️ Зоны</button>
+
+            {/* Зоны — только для суперадминов */}
+            {isSuperAdmin&&(
+              <button onClick={()=>navigate(`/camera/${name}/zones`)}
+                className={`w-full py-1.5 rounded ${T.btn} text-sm`}>⚙️ Зоны</button>
+            )}
           </div>
         </div>
       )}
@@ -687,7 +879,8 @@ function Camera() {
                         {userTelegram&&!showTgInput&&(
                           <TypeSelector title="Уведомления в Telegram" selected={telegramSubs}
                             onToggle={t=>setTelegramSubs(p=>p.includes(t)?p.filter(x=>x!==t):[...p,t])}
-                            onClose={()=>setOpenChannel(null)} onSave={()=>setOpenChannel(null)} saveLabel="Готово"/>
+                            onClose={()=>setOpenChannel(null)}
+                            onSave={()=>saveTelegramSubs(telegramSubs)} saveLabel="Сохранить"/>
                         )}
                       </div>
                     )}

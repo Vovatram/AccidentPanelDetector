@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import axios from "axios";
 
@@ -8,8 +8,7 @@ const sevColor = s =>
   s === 0  ? "bg-gray-600 text-gray-300" :
   s >= 4   ? "bg-red-600 text-white"     :
   s >= 3   ? "bg-orange-500 text-white"  : "bg-yellow-500 text-white";
-const sevLabel = s =>
-  s === 0 ? "Ошибка" : String(s);
+const sevLabel = s => s === 0 ? "Ошибка" : String(s);
 
 function fmtDate(d) {
   if (!d) return "—";
@@ -21,8 +20,7 @@ function fmtDate(d) {
 function fmtShort(d) {
   if (!d) return "";
   return new Date(d).toLocaleString("ru-RU", {
-    day:"2-digit", month:"2-digit",
-    hour:"2-digit", minute:"2-digit"
+    day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit"
   });
 }
 
@@ -30,49 +28,71 @@ export default function IncidentPage() {
   const { id }   = useParams();
   const navigate = useNavigate();
 
+  // ── zoom / pan ──────────────────────────────────────────────────────────────
+  const imageContainerRef = useRef(null);
+  const [scale,     setScale]     = useState(1);
+  const [position,  setPosition]  = useState({x:0, y:0});
+  const [isDragging,setIsDragging]= useState(false);
+  const [dragStart, setDragStart] = useState({x:0, y:0});
+
+  const handleWheel = useCallback(e => {
+    if (!imageContainerRef.current) return;
+    e.preventDefault();
+    const delta    = e.deltaY > 0 ? -0.15 : 0.15;
+    const newScale = Math.min(Math.max(scale + delta, 0.5), 5);
+    const rect     = imageContainerRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const sf = newScale / scale;
+    setScale(newScale);
+    setPosition({x: mx - (mx - position.x) * sf, y: my - (my - position.y) * sf});
+  }, [scale, position]);
+
+  const handleMouseDown = e => {
+    if (scale > 1) {
+      setIsDragging(true);
+      setDragStart({x: e.clientX - position.x, y: e.clientY - position.y});
+    }
+  };
+  const handleMouseMove = e => {
+    if (isDragging && scale > 1)
+      setPosition({x: e.clientX - dragStart.x, y: e.clientY - dragStart.y});
+  };
+  const handleMouseUp = () => setIsDragging(false);
+
+  const zoomIn    = () => setScale(p => Math.min(p + 0.25, 5));
+  const zoomOut   = () => setScale(p => Math.max(p - 0.25, 0.5));
+  const resetZoom = () => { setScale(1); setPosition({x:0, y:0}); };
+
+  // ── incident data ───────────────────────────────────────────────────────────
   const [incident,  setIncident]  = useState(null);
   const [loading,   setLoading]   = useState(true);
   const [error,     setError]     = useState("");
   const [imgError,  setImgError]  = useState(false);
-  const [zoom,      setZoom]      = useState(1);
 
-  // Комментарии об ошибке
+  // ── panel ───────────────────────────────────────────────────────────────────
+  const [panelOpen,       setPanelOpen]       = useState(false);
   const [showMistakeForm, setShowMistakeForm] = useState(false);
   const [mistakeText,     setMistakeText]     = useState("");
   const [submitting,      setSubmitting]      = useState(false);
   const [showMistakes,    setShowMistakes]    = useState(false);
 
-  // Telegram
-  const [userProfile,    setUserProfile]    = useState(null);
-  const [showTgForm,     setShowTgForm]     = useState(false);
-  const [tgInput,        setTgInput]        = useState("");
-  const [tgSaving,       setTgSaving]       = useState(false);
-
   const token = localStorage.getItem("access_token");
-  const isAuth = !!token;
 
-  // Загружаем инцидент
   useEffect(() => {
-    setLoading(true); setImgError(false); setShowMistakeForm(false);
-    setMistakeText(""); setShowMistakes(false); setZoom(1);
+    setLoading(true); setImgError(false);
+    setShowMistakeForm(false); setMistakeText(""); setShowMistakes(false);
+    setScale(1); setPosition({x:0, y:0});
     axios.get(`${API}/incidents/${id}`)
       .then(r => { setIncident(r.data); setLoading(false); })
       .catch(() => { setError("Инцидент не найден"); setLoading(false); });
   }, [id]);
 
-  // Загружаем профиль если авторизован
-  useEffect(() => {
-    if (!isAuth) return;
-    axios.get(`${API}/user/profile`, { headers: { Authorization: `Bearer ${token}` } })
-      .then(r => setUserProfile(r.data))
-      .catch(() => {});
-  }, [isAuth]);
-
   const handleSubmitMistake = async () => {
     if (!mistakeText.trim()) return;
     setSubmitting(true);
     try {
-      const res = await axios.post(`${API}/incidents/${id}/report_error`,
+      await axios.post(`${API}/incidents/${id}/report_error`,
         { text: mistakeText.trim() },
         token ? { headers: { Authorization: `Bearer ${token}` } } : {}
       );
@@ -85,34 +105,22 @@ export default function IncidentPage() {
     setSubmitting(false);
   };
 
-  const handleSaveTelegram = async () => {
-    if (!tgInput.trim()) return;
-    setTgSaving(true);
-    try {
-      await axios.post(`${API}/user/telegram`,
-        { telegram: tgInput.trim().replace(/^@/, "") },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      setUserProfile(prev => ({ ...prev, telegram: tgInput.trim().replace(/^@/, "") }));
-      setShowTgForm(false);
-    } catch { alert("Ошибка сохранения"); }
-    setTgSaving(false);
-  };
-
+  // ── loading / error screens ─────────────────────────────────────────────────
   if (loading) return (
-    <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
-      <div className="text-center opacity-50">
+    <div className="fixed inset-0 bg-black flex items-center justify-center">
+      <div className="text-white opacity-50 text-center">
         <div className="text-4xl mb-3">⏳</div><p>Загрузка...</p>
       </div>
     </div>
   );
 
   if (error || !incident) return (
-    <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
-      <div className="text-center opacity-50">
+    <div className="fixed inset-0 bg-black flex items-center justify-center">
+      <div className="text-white opacity-50 text-center">
         <div className="text-4xl mb-3">🔍</div>
         <p>{error || "Не найден"}</p>
-        <button onClick={()=>navigate(-1)} className="mt-4 px-4 py-2 bg-gray-700 rounded hover:bg-gray-600">Назад</button>
+        <button onClick={() => navigate(-1)}
+          className="mt-4 px-4 py-2 bg-gray-700 rounded hover:bg-gray-600 text-white">Назад</button>
       </div>
     </div>
   );
@@ -120,100 +128,115 @@ export default function IncidentPage() {
   const mistakeCount = (incident.mistake || []).length;
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white flex flex-col">
+    <div className="fixed inset-0 bg-black overflow-hidden">
 
-      {/* Шапка */}
-      <div className="bg-gray-800 border-b border-gray-700 px-4 py-2 flex items-center gap-3">
-        <button onClick={()=>navigate(-1)}
-          className="w-9 h-9 rounded-full bg-gray-700 hover:bg-gray-600 flex items-center justify-center text-lg shrink-0">←</button>
-        <h1 className="text-base font-bold flex-1 truncate">Инцидент #{incident.id}</h1>
-        {mistakeCount > 0 && (
-          <span className="px-2 py-0.5 bg-orange-900 text-orange-300 rounded text-xs shrink-0">
-            {mistakeCount} {mistakeCount===1?"жалоба":"жалоб"}
-          </span>
-        )}
-      </div>
-
-      {/* Основной контент */}
-      <div className="flex-1 flex flex-col md:flex-row gap-4 p-4 max-w-6xl mx-auto w-full">
-
-        {/* ── Фото ── */}
-        <div className="flex-1 flex flex-col gap-3 min-w-0">
-          <div className="bg-gray-800 rounded-xl border border-gray-700 overflow-hidden relative"
-               style={{ minHeight: 200 }}>
-            {incident.screenshot_url && !imgError ? (
-              <>
-                <div className="overflow-hidden bg-black flex items-center justify-center"
-                     style={{ maxHeight:"70vh" }}>
-                  <img
-                    src={`${API}${incident.screenshot_url}`}
-                    alt="Скриншот"
-                    onError={()=>setImgError(true)}
-                    style={{
-                      transform:`scale(${zoom})`, transformOrigin:"center center",
-                      transition:"transform 0.2s ease",
-                      width:"100%", objectFit:"contain", maxHeight:"70vh"
-                    }}
-                  />
-                </div>
-                {/* Зум */}
-                <div className="absolute bottom-3 right-3 flex gap-1">
-                  {[{l:"+",fn:()=>setZoom(p=>Math.min(p+0.25,4))},
-                    {l:"⟲",fn:()=>setZoom(1)},
-                    {l:"−",fn:()=>setZoom(p=>Math.max(p-0.25,0.5))}].map(({l,fn})=>(
-                    <button key={l} onClick={fn}
-                      className="w-8 h-8 rounded-full bg-black bg-opacity-70 hover:bg-opacity-90 flex items-center justify-center text-white transition-colors">
-                      {l}
-                    </button>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <div className="flex items-center justify-center h-48 opacity-30">
-                <div className="text-center">
-                  <div className="text-5xl mb-2">📷</div>
-                  <p className="text-sm">{imgError ? "Фото недоступно" : "Фото не сохранено"}</p>
-                </div>
+      {/* ── Фото на весь экран ── */}
+      <div
+        ref={imageContainerRef}
+        className="absolute inset-0"
+        style={{top: 48}}
+        onWheel={handleWheel}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+      >
+        <div
+          className="w-full h-full overflow-hidden bg-black"
+          onMouseDown={handleMouseDown}
+          style={{cursor: scale > 1 ? (isDragging ? "grabbing" : "grab") : "default"}}
+        >
+          {incident.screenshot_url && !imgError ? (
+            <div style={{
+              transform: `scale(${scale}) translate(${position.x/scale}px,${position.y/scale}px)`,
+              transformOrigin: "0 0",
+              height: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              transition: isDragging ? "none" : "transform 0.1s ease",
+            }}>
+              <img
+                src={`${API}${incident.screenshot_url}`}
+                alt="Скриншот"
+                draggable={false}
+                onError={() => setImgError(true)}
+                style={{maxWidth:"100%", maxHeight:"100%", objectFit:"contain", userSelect:"none"}}
+              />
+            </div>
+          ) : (
+            <div className="w-full h-full flex items-center justify-center">
+              <div className="text-white opacity-30 text-center">
+                <div className="text-6xl mb-3">📷</div>
+                <p className="text-sm">{imgError ? "Фото недоступно" : "Фото не сохранено"}</p>
               </div>
-            )}
-          </div>
-
-          {incident.screenshot_url && !imgError && (
-            <a href={`${API}${incident.screenshot_url}`} download
-              className="w-full py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm text-center transition-colors">
-              ⬇️ Скачать фото
-            </a>
-          )}
-
-          {/* ── Список комментариев об ошибке ── */}
-          {mistakeCount > 0 && (
-            <div className="bg-gray-800 rounded-xl border border-gray-700 p-3">
-              <button onClick={()=>setShowMistakes(p=>!p)}
-                className="flex items-center justify-between w-full text-sm font-semibold">
-                <span>⚠️ Комментарии об ошибке ({mistakeCount})</span>
-                <span className="text-gray-400">{showMistakes?"▲":"▼"}</span>
-              </button>
-              {showMistakes && (
-                <div className="mt-2 space-y-2 max-h-48 overflow-y-auto">
-                  {(incident.mistake||[]).map((m, i) => (
-                    <div key={i} className="bg-gray-700 rounded-lg p-2.5 text-sm">
-                      <p className="text-gray-100">{m.text}</p>
-                      <p className="text-xs text-gray-400 mt-1">{fmtShort(m.date)}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           )}
         </div>
+      </div>
 
-        {/* ── Детали + действия ── */}
-        <div className="w-full md:w-80 flex flex-col gap-3 shrink-0">
+      {/* ── Шапка ── */}
+      <div className="absolute top-0 left-0 right-0 z-20 h-12 flex items-center gap-2 px-3
+                      bg-gradient-to-b from-black/70 to-transparent">
+        <button onClick={() => navigate(-1)}
+          className="w-9 h-9 rounded-full bg-black/60 hover:bg-black/80 text-white flex items-center justify-center text-lg backdrop-blur-sm shrink-0">
+          ←
+        </button>
+
+        <span className="text-white font-bold text-sm bg-black/60 px-3 py-1 rounded-full backdrop-blur-sm">
+          #{incident.id} · {incident.notification_text}
+        </span>
+
+        {/* Zoom controls */}
+        <div className="flex gap-1 ml-1">
+          {[{l:"+", fn:zoomIn},{l:"⟲", fn:resetZoom},{l:"−", fn:zoomOut}].map(({l,fn})=>(
+            <button key={l} onClick={fn}
+              className="w-8 h-8 rounded-full bg-black/60 hover:bg-black/80 text-white flex items-center justify-center text-sm backdrop-blur-sm">
+              {l}
+            </button>
+          ))}
+          {scale !== 1 && (
+            <span className="text-white text-xs bg-black/60 px-2 rounded-full flex items-center backdrop-blur-sm">
+              {Math.round(scale * 100)}%
+            </span>
+          )}
+        </div>
+
+        {/* Toggle panel */}
+        <button
+          onClick={() => setPanelOpen(p => !p)}
+          className={`ml-auto px-3 py-1.5 rounded-full text-sm font-semibold backdrop-blur-sm transition-colors ${
+            panelOpen ? "bg-indigo-600 text-white" : "bg-black/60 text-white hover:bg-black/80"
+          }`}>
+          Детали {panelOpen ? "▲" : "▼"}
+          {mistakeCount > 0 && (
+            <span className="ml-1.5 px-1.5 py-0.5 bg-orange-600 rounded-full text-xs">{mistakeCount}</span>
+          )}
+        </button>
+      </div>
+
+      {/* ── Навигация (внизу по центру) ── */}
+      <div className="absolute bottom-4 left-0 right-0 z-20 flex justify-center gap-3 pointer-events-none">
+        <button onClick={() => navigate(`/incident/${Number(id)-1}`, { replace: true })} disabled={Number(id) <= 1}
+          className="pointer-events-auto px-5 py-2 rounded-full bg-black/60 hover:bg-black/80 text-white text-sm disabled:opacity-30 backdrop-blur-sm transition-colors">
+          ← Пред.
+        </button>
+        <button onClick={() => navigate(`/incident/${Number(id)+1}`, { replace: true })}
+          className="pointer-events-auto px-5 py-2 rounded-full bg-black/60 hover:bg-black/80 text-white text-sm backdrop-blur-sm transition-colors">
+          След. →
+        </button>
+      </div>
+
+      {/* ── Плавающая панель деталей ── */}
+      {panelOpen && (
+        <div className="absolute right-3 top-14 z-30 w-76 max-h-[calc(100vh-4.5rem)] overflow-y-auto
+                        bg-gray-900/95 border border-gray-700 rounded-xl shadow-2xl backdrop-blur-sm
+                        flex flex-col"
+             style={{width: 304}}>
 
           {/* Информация */}
-          <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
-            <h2 className="font-bold text-sm mb-3">Детали</h2>
-            <div className="space-y-2.5 text-sm">
+          <div className="p-4 border-b border-gray-700">
+            <h2 className="font-bold text-xs text-gray-400 uppercase tracking-wide mb-3">Детали</h2>
+            <div className="space-y-3 text-sm text-white">
               <div>
                 <div className="text-xs text-gray-400 mb-0.5">Тип нарушения</div>
                 <div className="font-semibold">{incident.notification_text}</div>
@@ -221,44 +244,65 @@ export default function IncidentPage() {
               <div>
                 <div className="text-xs text-gray-400 mb-0.5">Камера</div>
                 <div className="flex items-center gap-2">
-                  <span>{incident.camera}</span>
-                  <button onClick={()=>navigate(`/camera/${encodeURIComponent(incident.camera)}`)}
-                    className="text-xs text-indigo-400 hover:text-indigo-300">Открыть →</button>
+                  <span className="flex-1 text-sm">{incident.camera}</span>
+                  <button onClick={() => navigate(`/camera/${encodeURIComponent(incident.camera)}`)}
+                    className="text-xs text-indigo-400 hover:text-indigo-300 shrink-0">Открыть →</button>
                 </div>
               </div>
               <div>
                 <div className="text-xs text-gray-400 mb-0.5">Дата и время</div>
                 <div>{fmtDate(incident.date)}</div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex gap-6">
                 <div>
                   <div className="text-xs text-gray-400 mb-0.5">Тяжесть</div>
                   <span className={`px-2 py-0.5 rounded text-xs ${sevColor(incident.severity)}`}>
                     {sevLabel(incident.severity)}
                   </span>
                 </div>
-                <div className="ml-4">
+                <div>
                   <div className="text-xs text-gray-400 mb-0.5">ID</div>
-                  <span className="text-gray-300 text-sm">#{incident.id}</span>
+                  <span className="text-gray-300">#{incident.id}</span>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Сообщить об ошибке */}
-          <div className="bg-gray-800 rounded-xl border border-gray-700 p-4">
+          {/* Скачать */}
+          {incident.screenshot_url && !imgError && (
+            <div className="px-4 py-3 border-b border-gray-700">
+              <a href={`${API}${incident.screenshot_url}`} download
+                className="block w-full py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm text-center transition-colors">
+                ⬇️ Скачать фото
+              </a>
+            </div>
+          )}
+
+          {/* Комментарии об ошибке */}
+          <div className="px-4 py-3 border-b border-gray-700">
             <div className="flex items-center justify-between mb-2">
-              <h2 className="font-bold text-sm">Сообщить об ошибке</h2>
+              <h2 className="font-bold text-xs text-gray-400 uppercase tracking-wide">Сообщить об ошибке</h2>
               {mistakeCount > 0 && (
-                <button onClick={()=>setShowMistakes(p=>!p)}
+                <button onClick={() => setShowMistakes(p => !p)}
                   className="text-xs text-orange-400 hover:text-orange-300">
-                  ({mistakeCount}) просмотреть
+                  {mistakeCount} {showMistakes ? "▲" : "▼"}
                 </button>
               )}
             </div>
 
+            {showMistakes && (
+              <div className="mb-2 space-y-1.5 max-h-36 overflow-y-auto">
+                {(incident.mistake || []).map((m, i) => (
+                  <div key={i} className="bg-gray-800 rounded-lg p-2 text-xs text-white">
+                    <p className="text-gray-100">{m.text}</p>
+                    <p className="text-gray-500 mt-0.5">{fmtShort(m.date)}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {!showMistakeForm ? (
-              <button onClick={()=>setShowMistakeForm(true)}
+              <button onClick={() => setShowMistakeForm(true)}
                 className="w-full py-2 bg-gray-700 hover:bg-red-900 border border-gray-600 hover:border-red-700 text-white rounded-lg text-sm transition-colors">
                 ⚠️ Ошибка детекции
               </button>
@@ -266,19 +310,19 @@ export default function IncidentPage() {
               <div className="space-y-2">
                 <textarea
                   value={mistakeText}
-                  onChange={e=>setMistakeText(e.target.value)}
-                  placeholder="Опишите ошибку (необязательно)..."
+                  onChange={e => setMistakeText(e.target.value)}
+                  placeholder="Опишите ошибку..."
                   rows={3}
                   className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm
                              focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
                 />
                 <div className="flex gap-2">
                   <button onClick={handleSubmitMistake} disabled={submitting}
-                    className="flex-1 py-2 bg-red-700 hover:bg-red-600 text-white rounded-lg text-sm font-semibold disabled:opacity-50 transition-colors">
+                    className="flex-1 py-2 bg-red-700 hover:bg-red-600 text-white rounded-lg text-sm font-semibold disabled:opacity-50">
                     {submitting ? "Отправка..." : "Отправить"}
                   </button>
-                  <button onClick={()=>{setShowMistakeForm(false);setMistakeText("");}}
-                    className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors">
+                  <button onClick={() => { setShowMistakeForm(false); setMistakeText(""); }}
+                    className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm">
                     Отмена
                   </button>
                 </div>
@@ -286,20 +330,19 @@ export default function IncidentPage() {
             )}
           </div>
 
-          
           {/* Навигация */}
-          <div className="flex gap-2">
-            <button onClick={()=>navigate(`/incident/${Number(id)-1}`)} disabled={Number(id)<=1}
-              className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm disabled:opacity-30 transition-colors">
+          <div className="px-4 py-3 flex gap-2">
+            <button onClick={() => navigate(`/incident/${Number(id)-1}`, { replace: true })} disabled={Number(id) <= 1}
+              className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm disabled:opacity-30 transition-colors">
               ← Пред.
             </button>
-            <button onClick={()=>navigate(`/incident/${Number(id)+1}`)}
-              className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors">
+            <button onClick={() => navigate(`/incident/${Number(id)+1}`, { replace: true })}
+              className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors">
               След. →
             </button>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 from fastapi import FastAPI,Query, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import sessionmaker
@@ -31,14 +31,16 @@ import time
 import math
 from ultralytics import YOLO
 from jose import JWTError 
+import os
+from dotenv import load_dotenv
 
 ph = PasswordHasher()
 
 
 '''
-psql -U postgres -p 5432
-
 psql -U postgres
+
+psql -U postgres -p 5433
 \c apd
 CREATE TABLE cameras (
     id SERIAL PRIMARY KEY,
@@ -55,14 +57,17 @@ CREATE TABLE superadmins (
 );
 
 -- Новые столбцы:
-ALTER TABLE users     ADD COLUMN IF NOT EXISTS telegram VARCHAR(255);
+ALTER TABLE users     ADD COLUMN IF NOT EXISTS telegram         VARCHAR(255);
+ALTER TABLE users     ADD COLUMN IF NOT EXISTS telegram_chat_id VARCHAR(255);
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS mistake  JSONB NOT NULL DEFAULT '[]';
-git add .
 
+git add .
 git commit --amend --no-edit  
 git push --force-with-lease origin main
 
-git commit -m "Second commit"
+git add .
+git commit -m "work version 1"
+git push
 
 cd frontend
 $env:PATH="E:\AccidentPanelDetector\frontend\node-v24.12.0-win-x64;$env:PATH"
@@ -82,20 +87,23 @@ npm.cmd install maplibre-gl
 # КОНСТАНТЫ — меняй здесь, не трогая остальной код
 # =============================================================================
 
-# Список ID камер для обработки. None = все камеры из БД.
-ACTIVE_CAMERA_IDS: list[int] | None = [1]
+# Управление камерами теперь через столбец incidents в таблице cameras:
+#   null  = все типы детекции активны
+#   false = камера выключена
+#   [..] = конкретные типы
+# ACTIVE_CAMERA_IDS больше не используется.
 
 # Cooldown между сохранениями одного типа инцидента на одной камере (секунд)
-INCIDENT_SAVE_COOLDOWN = 10
+INCIDENT_SAVE_COOLDOWN = 5 * 60
 
 # Как часто (в секундах) перечитывать зоны камеры из БД
-CAMERA_ZONES_REFRESH_INTERVAL = 30
+CAMERA_ZONES_REFRESH_INTERVAL = 10
 
 # Папка для скриншотов инцидентов
 INCIDENTS_PHOTOS_DIR = "incidents"
 
 # Сохранять ли скриншоты на диск (False = только запись в БД)
-SAVE_INCIDENT_SCREENSHOTS = False
+SAVE_INCIDENT_SCREENSHOTS = True
 
 # =============================================================================
 
@@ -124,26 +132,76 @@ Base = declarative_base()
 #Base.metadata.create_all(bind=engine)
 app = FastAPI()
 
+def _start_camera_worker(cam):
+    """Запускает camera_worker для одной камеры и регистрирует её id."""
+    _running_camera_ids.add(cam.id)
+    asyncio.create_task(camera_worker(cam))
+
+
+async def _camera_watchdog():
+    """Каждые 30 сек проверяет камеры: если incidents != false и воркер ещё не запущен — стартует."""
+    while True:
+        await asyncio.sleep(30)
+        db = SessionLocal()
+        try:
+            cameras = db.query(Camera).all()
+            for cam in cameras:
+                if cam.id in _running_camera_ids:
+                    continue
+                inc = _get_camera_incidents(cam.id)
+                if inc is not False:
+                    print(f"[watchdog] Камера {cam.id} ({cam.name}): запускаю воркер")
+                    _start_camera_worker(cam)
+        except Exception as e:
+            print(f"[watchdog] Ошибка: {e}")
+        finally:
+            db.close()
+
+
 @app.on_event("startup")
 async def start_camera_workers():
     """
-    Запускает camera_worker для всех (или выбранных) камер при старте сервера.
-    Воркеры работают постоянно, независимо от WebSocket-подключений.
+    Запускает camera_worker только для активных камер (incidents != false).
+    Камеры с incidents=false пропускаются; watchdog включит их когда они будут re-enabled.
     """
     global camera_tasks_started
     db = SessionLocal()
     try:
         cameras = db.query(Camera).all()
         started = 0
+        skipped = 0
         for cam in cameras:
-            if ACTIVE_CAMERA_IDS is not None and cam.id not in ACTIVE_CAMERA_IDS:
+            inc = _get_camera_incidents(cam.id)
+            if inc is False:
+                print(f"[startup] Камера {cam.id} ({cam.name}): отключена (incidents=false), пропускаю")
+                skipped += 1
                 continue
-            asyncio.create_task(camera_worker(cam))
+            _start_camera_worker(cam)
             started += 1
         camera_tasks_started = True
-        print(f"[startup] Запущено воркеров камер: {started}")
+        print(f"[startup] Запущено воркеров: {started}, пропущено (отключены): {skipped}")
     finally:
         db.close()
+
+    asyncio.create_task(_camera_watchdog())
+
+    # Предзаполняем кэш chat_id из БД (пользователи, ранее запустившие бота)
+    db2 = SessionLocal()
+    try:
+        tg_users = db2.query(User).filter(
+            User.telegram != None, User.telegram_chat_id != None
+        ).all()
+        for u in tg_users:
+            _tg_chat_id_cache[u.telegram.lower()] = u.telegram_chat_id
+        if tg_users:
+            print(f"[startup] Загружено {len(tg_users)} Telegram chat_id из БД")
+    except Exception as e:
+        print(f"[startup] Ошибка загрузки Telegram chat_id: {e}")
+    finally:
+        db2.close()
+
+    asyncio.create_task(_telegram_poll_loop())
+    print("[startup] Telegram polling запущен")
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,7 +240,8 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     self_cams     = Column(JSONB, default=dict)     # []
     notifications = Column(JSONB, default=dict)    # {}
-    telegram      = Column(String(255), nullable=True)
+    telegram         = Column(String(255), nullable=True)
+    telegram_chat_id = Column(String(255), nullable=True)
 
     def __repr__(self):
         return f"<User email={self.email}>"
@@ -200,6 +259,7 @@ class Camera(Base):
     stop_zones      = Column(JSONB, nullable=False, server_default='[]')
     crosswalk_zones = Column(JSONB, nullable=False, server_default='[]')
     lane_lines      = Column(JSONB, nullable=False, server_default='[]')
+    # incidents управляется через raw SQL (не в ORM), чтобы не ломать SELECT * при отсутствии столбца
 
 
 class Incident(Base):
@@ -215,7 +275,50 @@ class Incident(Base):
     # mistake: [{"text": "...", "date": "ISO"}, ...]
 
 
-# Создаём таблицу, если её нет
+class SuperAdmin(Base):
+    __tablename__ = "superadmins"
+    id    = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False, unique=True)
+
+
+def _get_camera_incidents(camera_id):
+    """Читает столбец incidents из cameras через raw SQL. Возвращает None если столбца нет."""
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT incidents FROM cameras WHERE id = :id"),
+            {"id": camera_id}
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+def _set_camera_incidents(camera_id, incidents):
+    """Записывает столбец incidents через raw SQL. Кидает исключение при ошибке."""
+    import json as _j
+    db = SessionLocal()
+    try:
+        if incidents is None:
+            db.execute(
+                text("UPDATE cameras SET incidents = NULL WHERE id = :id"),
+                {"id": camera_id}
+            )
+        else:
+            db.execute(
+                text("UPDATE cameras SET incidents = CAST(:v AS jsonb) WHERE id = :id"),
+                {"v": _j.dumps(incidents), "id": camera_id}
+            )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[_set_camera_incidents] Ошибка camera_id={camera_id}: {e}")
+        raise
+    finally:
+        db.close()
+
 
 class CounterResponse(BaseModel):
     value: int
@@ -416,49 +519,99 @@ load_dotenv()
 # =============================================================================
 import httpx
 
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_52axfCbM_F17547aFPrtiKidXMWvmmHWP")
-RESEND_FROM    = os.getenv("RESEND_FROM", "onboarding@resend.dev")   # замени на свой домен после верификации
-RESEND_API_URL = "https://api.resend.com/emails"
-
-
 # ── MailerSend ──────────────────────────────────────────────────────────────
-MAILERSEND_API_TOKEN = os.getenv("MAILERSEND_API_TOKEN",
-    "mlsn.5506f13fff437889834ea41c63ec4e37c8992f9fdb837e7e5f7079fd88b67344")
-MAILERSEND_FROM      = os.getenv("MAILERSEND_FROM",
-    "vovatram@test-zxk54v850dzljy6v.mlsender.net")
-MAILERSEND_FROM_NAME = os.getenv("MAILERSEND_FROM_NAME", "Accident Detector")
+MAILERSEND_API_TOKEN = os.getenv("MAILERSEND_API_TOKEN")
+MAILERSEND_FROM      = os.getenv("MAILERSEND_FROM")
+MAILERSEND_FROM_NAME = os.getenv("MAILERSEND_FROM_NAME")
 MAILERSEND_API_URL   = "https://api.mailersend.com/v1/email"
 
 # ── Telegram Bot ─────────────────────────────────────────────────────────────
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN",
-    "8836806020:AAF9BCqmoYWPyfvqOW9KiPWDmOkId2QaCO4")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_BOT_USERNAME = "@Accident_DetectorBot"
 TG_BASE_URL  = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 
-def _resolve_tg_chat_id(username: str) -> str | None:
-    """Ищет chat_id пользователя по @username среди писавших боту."""
+# username (lowercase, без @) → chat_id; живёт в памяти, наполняется поллингом
+_tg_chat_id_cache: dict[str, str] = {}
+_tg_update_offset: int = 0
+
+
+def _poll_telegram_updates():
+    """Читает новые апдейты из Telegram, сохраняет chat_id в кэш и БД."""
+    global _tg_update_offset
     import requests as req_lib
     try:
-        resp = req_lib.get(f"{TG_BASE_URL}/getUpdates", timeout=10).json()
-        if resp.get("ok"):
-            uname = username.lstrip("@").lower()
-            for update in resp.get("result", []):
-                chat = update.get("message", {}).get("chat", {})
-                if chat.get("username", "").lower() == uname:
-                    return str(chat["id"])
+        resp = req_lib.get(
+            f"{TG_BASE_URL}/getUpdates",
+            params={"offset": _tg_update_offset, "limit": 100, "timeout": 0},
+            timeout=15,
+        ).json()
+        if not resp.get("ok"):
+            return
+        updates = resp.get("result", [])
+        if not updates:
+            return
+        db = SessionLocal()
+        try:
+            for upd in updates:
+                _tg_update_offset = max(_tg_update_offset, upd["update_id"] + 1)
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+                chat     = msg.get("chat", {})
+                username = chat.get("username", "").lower()
+                chat_id  = str(chat.get("id", ""))
+                if not username or not chat_id:
+                    continue
+
+                _tg_chat_id_cache[username] = chat_id
+
+                # Сохраняем в БД если этот username привязан к пользователю
+                user = db.query(User).filter(
+                    User.telegram.ilike(username)
+                ).first()
+                if user and user.telegram_chat_id != chat_id:
+                    user.telegram_chat_id = chat_id
+                    db.commit()
+                    print(f"[telegram] chat_id сохранён для @{username}: {chat_id}")
+
+                # Отвечаем на /start
+                if msg.get("text", "").startswith("/start"):
+                    reply = (
+                        "✅ Привязка подтверждена! Вы будете получать Telegram-уведомления."
+                        if user else
+                        "⚠️ Ваш @username не найден в системе. "
+                        "Сначала укажите его в настройках на сайте."
+                    )
+                    try:
+                        req_lib.post(
+                            f"{TG_BASE_URL}/sendMessage",
+                            json={"chat_id": chat_id, "text": reply},
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+        finally:
+            db.close()
     except Exception as e:
-        print(f"[telegram] resolve error: {e}")
-    return None
+        print(f"[telegram] Ошибка поллинга: {e}")
 
 
-def send_telegram(username: str, text: str,
+async def _telegram_poll_loop():
+    """Запускается при старте сервера, опрашивает бота каждые 10 секунд."""
+    while True:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _poll_telegram_updates)
+        except Exception as e:
+            print(f"[telegram] poll loop error: {e}")
+        await asyncio.sleep(10)
+
+
+def send_telegram(chat_id: str, text: str,
                   photo_path: str | None = None) -> bool:
-    """Отправляет сообщение или фото в Telegram по @username."""
+    """Отправляет сообщение или фото в Telegram по chat_id."""
     import requests as req_lib
-    chat_id = _resolve_tg_chat_id(username)
     if not chat_id:
-        print(f"[telegram] Не найден chat_id для @{username}")
         return False
     try:
         if photo_path and os.path.exists(photo_path):
@@ -466,13 +619,14 @@ def send_telegram(username: str, text: str,
                 resp = req_lib.post(
                     f"{TG_BASE_URL}/sendPhoto",
                     data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},
-                    files={"photo": f}, timeout=30
+                    files={"photo": f},
+                    timeout=30,
                 )
         else:
             resp = req_lib.post(
                 f"{TG_BASE_URL}/sendMessage",
                 json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=10
+                timeout=10,
             )
         ok = resp.json().get("ok", False)
         if not ok:
@@ -513,20 +667,24 @@ def notify_incident(camera_name: str, incident_type: str,
                     severity: int, date: datetime,
                     screenshot_path: str | None = None):
     """
-    Рассылает уведомление об инциденте всем пользователям
-    у которых эта камера есть в подписках.
-    Канал: email если email в подписках, telegram если есть @username.
+    Рассылает уведомление об инциденте всем пользователям.
+    Email — по site-подпискам (notifications[camera]).
+    Telegram — по отдельным Telegram-подпискам (notifications[tg:camera]).
     """
     db = SessionLocal()
     try:
         users = db.query(User).all()
         for user in users:
-            notifs = user.notifications or {}
-            subs   = notifs.get(camera_name, [])
-            if not subs:
-                continue
-            # Проверяем что тип инцидента в подписках
-            if incident_type not in subs:
+            notifs    = user.notifications or {}
+            site_subs  = notifs.get(camera_name, [])
+            tg_subs    = notifs.get(f"tg:{camera_name}", None)    # None = не настроено
+            email_subs = notifs.get(f"email:{camera_name}", None)  # None = не настроено
+
+            want_email = (email_subs is not None and incident_type in email_subs)
+            want_tg    = (user.telegram and tg_subs is not None
+                          and incident_type in tg_subs)
+
+            if not want_email and not want_tg:
                 continue
 
             dt_str  = date.strftime("%d.%m.%Y %H:%M")
@@ -544,15 +702,20 @@ def notify_incident(camera_name: str, incident_type: str,
                 f"🕐 {dt_str}"
             )
 
-            # Email
-            try:
-                send_email_sync(EmailSchema(to=user.email, subject=subject, body=body))
-            except Exception as e:
-                print(f"[notify] email error {user.email}: {e}")
+            if want_email:
+                print('Попытка отправить письмо')
+                try:
+                    send_email_sync(EmailSchema(to=user.email, subject=subject, body=body))
+                except Exception as e:
+                    print(f"[notify] email error {user.email}: {e}")
 
-            # Telegram
-            if user.telegram:
-                send_telegram(user.telegram, tg_text, screenshot_path)
+            if want_tg:
+                tg_chat_id = (user.telegram_chat_id
+                              or _tg_chat_id_cache.get((user.telegram or "").lower()))
+                if tg_chat_id:
+                    send_telegram(tg_chat_id, tg_text, screenshot_path)
+                else:
+                    print(f"[notify] нет chat_id для @{user.telegram} — пользователь не запустил бота")
 
     except Exception as e:
         print(f"[notify_incident] Ошибка: {e}")
@@ -670,9 +833,6 @@ async def video_stream(ws: WebSocket, db: Session = Depends(get_db)):
         if not camera_tasks_started:
             cameras = db.query(Camera).all()
             for cam in cameras:
-                # Если ACTIVE_CAMERA_IDS задан — пропускаем камеры не из списка
-                if ACTIVE_CAMERA_IDS is not None and cam.id not in ACTIVE_CAMERA_IDS:
-                    continue
                 asyncio.create_task(camera_worker(cam))
             camera_tasks_started = True
 
@@ -690,6 +850,8 @@ async def video_stream(ws: WebSocket, db: Session = Depends(get_db)):
                 upd = await asyncio.wait_for(ws.receive_json(), timeout=0.01)
                 if isinstance(upd, dict) and upd.get("type") == "set_display_filters":
                     display_filters = upd.get("display_filters", ["all"])
+                elif isinstance(upd, dict) and upd.get("type") == "set_filters":
+                    filters = upd.get("filters", ["all"])
             except (asyncio.TimeoutError, Exception):
                 pass
 
@@ -732,6 +894,33 @@ async def video_stream(ws: WebSocket, db: Session = Depends(get_db)):
 # }
 camera_states: dict[int, dict] = {}
 camera_tasks_started = False
+_running_camera_ids: set = set()  # id камер, для которых уже запущен camera_worker
+
+
+@app.post("/camera-incidents")
+async def set_camera_incidents(
+    data: dict = Body(...),
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Суперадмин управляет детекцией камеры.
+    data.incidents = false (камера выключена) | ["traffic_jam", ...] (конкретные типы)
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    admin = db.query(SuperAdmin).filter(SuperAdmin.email == current_user).first()
+    if not admin:
+        raise HTTPException(status_code=403, detail="Нет прав")
+    cam = db.query(Camera).filter(Camera.name == data.get("name", "")).first()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Камера не найдена")
+    try:
+        _set_camera_incidents(cam.id, data.get("incidents"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True}
+
 
 @app.post("/user/site-notifications")
 async def save_site_notifications(
@@ -784,6 +973,28 @@ async def get_site_notifications(
     }
 
 
+@app.post("/user/telegram-subscriptions")
+async def save_telegram_subscriptions(
+    data: dict = Body(...),
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Сохраняет Telegram-подписки пользователя для камеры (независимо от email/site)."""
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    camera_name   = data.get("camera")
+    subscriptions = data.get("subscriptions", [])
+    user = db.query(User).filter(User.email == current_user).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    notifs = dict(user.notifications or {})
+    notifs[f"tg:{camera_name}"] = subscriptions
+    user.notifications = notifs
+    flag_modified(user, "notifications")
+    db.commit()
+    return {"ok": True}
+
+
 @app.websocket("/ws/notifications")
 async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
     """
@@ -824,28 +1035,36 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
             except Exception:
                 pass
 
+        tg_subs_init = None
         if current_user:
             user = db.query(User).filter(User.email == current_user).first()
             if user and user.notifications:
-                user_subs = user.notifications.get(camera_name)
+                user_subs    = user.notifications.get(camera_name)
+                tg_subs_init = user.notifications.get(f"tg:{camera_name}")
 
         # Финальный список подписок: приоритет у пользовательских настроек из БД
         subscriptions = user_subs if user_subs is not None else client_subs
+        # subs_explicit=True когда пользователь явно настроил подписки (даже пустой список)
+        subs_explicit = user_subs is not None
 
         # Подтверждаем подключение
         await ws.send_json({
-            "type": "connected",
-            "authenticated": bool(current_user),
-            "subscriptions": subscriptions
+            "type":                  "connected",
+            "authenticated":         bool(current_user),
+            "subscriptions":         subscriptions,
+            "telegram_subscriptions": tg_subs_init,  # None если не настроено
         })
 
         # last_incident_id = 0 означает «пришли историю с нуля»
         last_incident_id = 0
 
-        def _filter_by_subs(incidents_list, subs):
-            """Фильтрует по подпискам. Пустой список subs = пропустить всё."""
+        def _filter_by_subs(incidents_list, subs, explicit=False):
+            """Фильтрует по подпискам.
+            explicit=True + subs=[] → вернуть пустой список (явно снял все подписки).
+            explicit=False + subs=[] → вернуть всё (не настраивал подписки / гость).
+            """
             if not subs:
-                return incidents_list
+                return [] if explicit else incidents_list
             return [i for i in incidents_list
                     if TEXT_TO_TYPE.get(i.notification_text, i.notification_text) in subs]
 
@@ -872,7 +1091,7 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
 
             if history:
                 last_incident_id = history[-1].id
-                filtered_history = _filter_by_subs(history, subscriptions)
+                filtered_history = _filter_by_subs(history, subscriptions, subs_explicit)
                 if filtered_history:
                     await ws.send_json({
                         "type": "incidents",
@@ -888,7 +1107,8 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
                     msg = await asyncio.wait_for(ws.receive_json(), timeout=0.05)
                     if msg.get("type") == "update_subscriptions":
                         new_subs = msg.get("subscriptions", [])
-                        subscriptions = new_subs   # обновляем в памяти в любом случае
+                        subscriptions = new_subs
+                        subs_explicit = True   # пользователь явно выбрал (даже пустой список)
                         if current_user:
                             try:
                                 user = db.query(User).filter(User.email == current_user).first()
@@ -896,8 +1116,6 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
                                     notifs = dict(user.notifications or {})
                                     notifs[camera_name] = new_subs
                                     user.notifications = notifs
-                                    # flag_modified обязателен для JSONB — иначе SQLAlchemy
-                                    # не видит изменение вложенного dict и не делает UPDATE
                                     from sqlalchemy.orm.attributes import flag_modified
                                     flag_modified(user, "notifications")
                                     db.commit()
@@ -905,6 +1123,23 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
                             except Exception as e:
                                 print(f"[ws/notifications] Ошибка сохранения подписок: {e}")
                                 db.rollback()
+                        # Сразу переотправляем историю с новым фильтром (reset=True → фронт заменит список)
+                        try:
+                            since_upd = datetime.now(timezone.utc) - timedelta(seconds=time_range)
+                            hist_upd = db.query(Incident).filter(
+                                Incident.camera == camera_name,
+                                Incident.date   >= since_upd,
+                            ).order_by(Incident.id.asc()).all()
+                            if hist_upd:
+                                last_incident_id = hist_upd[-1].id
+                            filtered_upd = _filter_by_subs(hist_upd, subscriptions, subs_explicit)
+                            await ws.send_json({
+                                "type": "incidents",
+                                "reset": True,
+                                "incidents": _serialize(filtered_upd),
+                            })
+                        except Exception as e:
+                            print(f"[ws/notifications] Ошибка переотправки истории: {e}")
                         await ws.send_json({"type": "subscriptions_saved"})
 
                     elif msg.get("type") == "update_time_range":
@@ -918,9 +1153,12 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
                         ).order_by(Incident.id.asc()).all()
                         if history:
                             last_incident_id = history[-1].id
-                            filtered = _filter_by_subs(history, subscriptions)
-                            if filtered:
-                                await ws.send_json({"type": "incidents", "incidents": _serialize(filtered)})
+                        filtered = _filter_by_subs(history, subscriptions, subs_explicit)
+                        await ws.send_json({
+                            "type": "incidents",
+                            "reset": True,
+                            "incidents": _serialize(filtered),
+                        })
 
                 except asyncio.TimeoutError:
                     pass
@@ -938,7 +1176,7 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
 
                 if new_incidents:
                     last_incident_id = new_incidents[-1].id
-                    filtered_new = _filter_by_subs(new_incidents, subscriptions)
+                    filtered_new = _filter_by_subs(new_incidents, subscriptions, subs_explicit)
 
                     if filtered_new:
                         await ws.send_json({
@@ -1002,16 +1240,23 @@ async def stats_stream(ws: WebSocket, db: Session = Depends(get_db)):
     }
 
     async def compute_and_send(params):
-        camera_filter = params.get("camera") or None  # "" → None
-        types_filter  = params.get("types")  or None
-        step          = max(int(params.get("step", 3600)), 60)
+        # cameras (массив) имеет приоритет над camera (строка, легаси)
+        cameras_param = params.get("cameras")  # list | null
+        camera_param  = params.get("camera")   # string | null
+        if cameras_param and isinstance(cameras_param, list) and len(cameras_param) > 0:
+            camera_filter_list = cameras_param
+        elif camera_param:
+            camera_filter_list = [camera_param]
+        else:
+            camera_filter_list = None  # все камеры
+
+        types_filter = params.get("types") or None
+        step         = max(int(params.get("step", 3600)), 60)
         try:
             time_from = datetime.fromisoformat(params["time_from"].replace("Z", "+00:00"))
         except Exception:
             time_from = datetime.now(timezone.utc) - timedelta(hours=24)
 
-        # time_to = time_from + шаг × 10 страниц (24 столбца)  → максимум 240 бакетов
-        # Ограничиваем разумным количеством, чтобы не зависнуть
         MAX_BUCKETS = 300
         time_to = time_from + timedelta(seconds=step * MAX_BUCKETS)
 
@@ -1020,8 +1265,8 @@ async def stats_stream(ws: WebSocket, db: Session = Depends(get_db)):
             Incident.date >= time_from,
             Incident.date <  time_to,
         )
-        if camera_filter:
-            q = q.filter(Incident.camera == camera_filter)
+        if camera_filter_list:
+            q = q.filter(Incident.camera.in_(camera_filter_list))
         incidents = q.order_by(Incident.date.asc()).all()
 
         def norm_type(t):
@@ -1633,9 +1878,10 @@ async def camera_worker(camera):
     PED_CLASSES = [0]
     ALL_CLASSES = list(set(CAR_CLASSES + PED_CLASSES))
 
-    error_count       = 0
-    MAX_ERRORS        = 10
+    error_count        = 0
+    MAX_ERRORS         = 10
     last_zones_refresh = 0.0
+    _current_incidents = None  # читается из DB каждые CAMERA_ZONES_REFRESH_INTERVAL сек
 
     # Снимок зон на момент последней проверки — для сравнения
     _prev_zones = {
@@ -1653,6 +1899,9 @@ async def camera_worker(camera):
                     db = SessionLocal()
                     fresh = db.query(Camera).filter(Camera.id == camera.id).first()
                     if fresh:
+                        # Читаем incidents через raw SQL (не в ORM)
+                        _current_incidents = _get_camera_incidents(camera.id)
+
                         new_zones = {
                             "road_zones":      list(fresh.road_zones      or []),
                             "stop_zones":      list(fresh.stop_zones      or []),
@@ -1669,6 +1918,16 @@ async def camera_worker(camera):
                 finally:
                     db.close()
                 last_zones_refresh = now
+
+            # ── проверяем управление детекцией (из столбца incidents в БД) ──
+            # None  → все типы активны
+            # False → камера отключена — завершаем воркер (watchdog перезапустит при re-enable)
+            # [..]  → только указанные типы
+            if _current_incidents is False:
+                print(f"[camera_worker] Камера {camera.id} ({camera.name}): отключена, завершаю воркер")
+                cap.release()
+                _running_camera_ids.discard(camera.id)
+                return
 
             # ── читаем кадр ─────────────────────────────────────────────────
             ret, frame = cap.read()
@@ -1699,37 +1958,52 @@ async def camera_worker(camera):
 
             last_saved = worker_state["_last_saved"]
 
-            # ── детекторы (закомментируй строку чтобы выключить) ────────────
-            try:
-                tj_data = _detect_traffic_jam(frame, results, camera, worker_state)     # пробки
-                if tj_data and tj_data.get("jams"):
-                    _save_incident(camera, "traffic_jam", frame,
-                                   [j["box"] for j in tj_data["jams"]],
-                                   "Затор", (26, 165, 246), last_saved)
-            except Exception as e:
-                print(f"[camera_worker] Камера {camera.id}: ошибка _detect_traffic_jam — {e}")
-                tj_data = None
+            # Определяем какие детекторы запускать
+            _inc = _current_incidents   # None | list
+            if _inc is None:
+                run_tj = run_is = run_ped = True
+            else:
+                run_tj  = "traffic_jam"  in _inc
+                run_is  = "illegal_stop" in _inc
+                run_ped = "pedestrian"   in _inc
 
-            try:
-                is_data = _detect_illegal_stop(frame, results, camera, worker_state)    # стоянка
-                if is_data and is_data.get("violations"):
-                    _save_incident(camera, "illegal_stop", frame,
-                                   [v["box"] for v in is_data["violations"]],
-                                   "Стоянка в неположенном месте", (0, 0, 255), last_saved)
-            except Exception as e:
-                print(f"[camera_worker] Камера {camera.id}: ошибка _detect_illegal_stop — {e}")
-                is_data = None
+            # ── детекторы ────────────────────────────────────────────────────
+            tj_data = None
+            if run_tj:
+                try:
+                    tj_data = _detect_traffic_jam(frame, results, camera, worker_state)
+                    if tj_data and tj_data.get("jams"):
+                        _save_incident(camera, "traffic_jam", frame,
+                                       [j["box"] for j in tj_data["jams"]],
+                                       "Затор", (26, 165, 246), last_saved)
+                except Exception as e:
+                    print(f"[camera_worker] Камера {camera.id}: ошибка _detect_traffic_jam — {e}")
+                    tj_data = None
 
-            try:
-                ped_data = _detect_pedestrian(frame, results, camera, worker_state)     # пешеходы
-                if ped_data and ped_data.get("pedestrians"):
-                    _save_incident(camera, "pedestrian", frame,
-                                   [p["box"] for p in ped_data["pedestrians"]],
-                                   "Пешеход на проезжей части вне перехода",
-                                   (50, 130, 246), last_saved)
-            except Exception as e:
-                print(f"[camera_worker] Камера {camera.id}: ошибка _detect_pedestrian — {e}")
-                ped_data = None
+            is_data = None
+            if run_is:
+                try:
+                    is_data = _detect_illegal_stop(frame, results, camera, worker_state)
+                    if is_data and is_data.get("violations"):
+                        _save_incident(camera, "illegal_stop", frame,
+                                       [v["box"] for v in is_data["violations"]],
+                                       "Стоянка в неположенном месте", (0, 0, 255), last_saved)
+                except Exception as e:
+                    print(f"[camera_worker] Камера {camera.id}: ошибка _detect_illegal_stop — {e}")
+                    is_data = None
+
+            ped_data = None
+            if run_ped:
+                try:
+                    ped_data = _detect_pedestrian(frame, results, camera, worker_state)
+                    if ped_data and ped_data.get("pedestrians"):
+                        _save_incident(camera, "pedestrian", frame,
+                                       [p["box"] for p in ped_data["pedestrians"]],
+                                       "Пешеход на проезжей части вне перехода",
+                                       (50, 130, 246), last_saved)
+                except Exception as e:
+                    print(f"[camera_worker] Камера {camera.id}: ошибка _detect_pedestrian — {e}")
+                    ped_data = None
 
             camera_states[camera.id] = {
                 "frame": frame,
@@ -1843,13 +2117,13 @@ async def get_camera_zones(
     camera = db.query(Camera).filter(Camera.name == name).first()
     if not camera:
         raise HTTPException(status_code=404, detail="Камера не найдена")
- 
     return {
         "name":            camera.name,
         "road_zones":      camera.road_zones or [],
         "stop_zones":      camera.stop_zones or [],
         "crosswalk_zones": camera.crosswalk_zones or [],
         "lane_lines":      camera.lane_lines or [],
+        "incidents":       _get_camera_incidents(camera.id),
     }
  
  

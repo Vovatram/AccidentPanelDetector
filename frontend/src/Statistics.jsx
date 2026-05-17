@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
 const INCIDENT_TYPES = [
   "Стоянка в неположенном месте","ДТП","Превышение скорости",
   "Пешеход в неположенном месте","Затор","Движение по встречке","Сбитие пешехода",
@@ -28,6 +30,17 @@ function toLocalISO(ts) {
   const d = new Date(ts);
   d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
   return d.toISOString().slice(0,16);
+}
+
+function fmtBucketLabel(tsFrom, stepSec) {
+  const d = new Date(tsFrom);
+  if (stepSec >= 86400)
+    return d.toLocaleDateString("ru-RU", { day:"2-digit", month:"2-digit" });
+  return d.toLocaleTimeString("ru-RU", { hour:"2-digit", minute:"2-digit" });
+}
+
+function fmtBucketDate(tsFrom) {
+  return new Date(tsFrom).toLocaleDateString("ru-RU", { day:"2-digit", month:"2-digit" });
 }
 
 function Tooltip({bucket,cameras,types,x,y,visible}) {
@@ -96,19 +109,33 @@ export default function Statistics() {
   const [wsStatus,   setWsStatus]   = useState("disconnected");
   const [loading,    setLoading]    = useState(false);
 
-  const [selectedCamera, setSelectedCamera] = useState(urlCamera ? decodeURIComponent(urlCamera) : "");
+  // [] = все камеры (отправляем cameras:null на бэк), [...] = конкретные
+  const [selectedCameras, setSelectedCameras] = useState(
+    () => urlCamera ? [decodeURIComponent(urlCamera)] : []
+  );
+  const [showCamFilter,  setShowCamFilter]  = useState(false);
   const [selectedTypes,  setSelectedTypes]  = useState([...INCIDENT_TYPES]);
   const [step,    setStep]    = useState(3600);
   const [cols,    setCols]    = useState(24);
-  const [timeFrom, setTimeFrom] = useState(()=>{ const d=new Date(); d.setDate(d.getDate()-1); d.setHours(0,0,0,0); return toLocalISO(d); });
+  const [timeFrom, setTimeFrom] = useState(()=>{ const d=new Date(); d.setHours(d.getHours()-24); return toLocalISO(d); });
   const [showTypeFilter, setShowTypeFilter] = useState(false);
-  const [pageStart, setPageStart] = useState(0);
   const [tooltip,   setTooltip]   = useState({visible:false,bucket:null,x:0,y:0});
   const [selectedBucket, setSelectedBucket] = useState(null);
 
-  const pageBuckets = useMemo(()=>allBuckets.slice(pageStart,pageStart+cols),[allBuckets,pageStart,cols]);
-  const totalPages  = Math.ceil(allBuckets.length/cols);
-  const currentPage = Math.floor(pageStart/cols);
+  // При смене URL-параметра (навигация с камеры) — выделяем именно её
+  useEffect(() => {
+    if (urlCamera) {
+      setSelectedCameras([decodeURIComponent(urlCamera)]);
+    } else {
+      setSelectedCameras([]);
+    }
+  }, [urlCamera]);
+
+  useEffect(()=>{
+    fetch(`${API}/stats/cameras`).then(r=>r.json()).then(d=>setAllCams(d)).catch(()=>{});
+  },[]);
+
+  const pageBuckets = useMemo(()=>allBuckets.slice(0, cols), [allBuckets, cols]);
 
   const maxVal = useMemo(()=>
     pageBuckets.reduce((m,b)=>{
@@ -122,20 +149,16 @@ export default function Statistics() {
       return acc;
     },{}),[allBuckets,cameras,types]);
 
-  useEffect(()=>{
-    fetch("/stats/cameras").then(r=>r.json()).then(d=>setAllCams(d)).catch(()=>{});
-  },[]);
-
   const buildParams = useCallback(()=>{
     const from = new Date(timeFrom);
+    const allSelected = selectedCameras.length === 0;
     return {
-      camera:    selectedCamera || null,   // "" → null на бэке через  `or None`
-      types:     selectedTypes.length===INCIDENT_TYPES.length?null:selectedTypes,
+      cameras:   allSelected ? null : selectedCameras,
+      types:     selectedTypes.length===INCIDENT_TYPES.length ? null : selectedTypes,
       step,
       time_from: from.toISOString(),
-      // time_to бэк высчитывает сам (step * 300 бакетов)
     };
-  },[selectedCamera,selectedTypes,step,cols,timeFrom]);
+  },[selectedCameras, selectedTypes, step, timeFrom]);
 
   const connect = useCallback(()=>{
     clearTimeout(reconnTimerRef.current);
@@ -151,7 +174,7 @@ export default function Statistics() {
           setAllBuckets(msg.buckets||[]);
           setCameras(msg.cameras||[]);
           setTypes(msg.types||[]);
-          setPageStart(0); setSelectedBucket(null); setLoading(false);
+          setSelectedBucket(null); setLoading(false);
         }
       } catch {}
     };
@@ -165,14 +188,41 @@ export default function Statistics() {
   useEffect(()=>{
     connect();
     return ()=>{ clearTimeout(reconnTimerRef.current); if(wsRef.current){wsRef.current.onclose=null;wsRef.current.close();} };
-  },[selectedCamera,selectedTypes,step,cols,timeFrom]);
+  },[selectedCameras, selectedTypes, step, cols, timeFrom]);
 
   const handleStepChange = val=>{
     const opt=STEP_OPTIONS.find(o=>o.value===val)||STEP_OPTIONS[2];
-    setStep(opt.value); setCols(opt.cols); setPageStart(0);
+    setStep(opt.value); setCols(opt.cols);
   };
-  const goPage = n=>{ const nx=Math.max(0,Math.min(totalPages-1,n)); setPageStart(nx*cols); setSelectedBucket(null); };
+  const shiftTime = dir => {
+    const d = new Date(timeFrom);
+    d.setSeconds(d.getSeconds() + dir * cols * step);
+    setTimeFrom(toLocalISO(d));
+    setSelectedBucket(null);
+  };
   const yTicks = [4,3,2,1,0].map(i=>Math.round(maxVal*i/4));
+
+  // Логика чекбоксов камер
+  const isCamChecked = cam => selectedCameras.length === 0 || selectedCameras.includes(cam);
+  const toggleCam = cam => {
+    if (isCamChecked(cam)) {
+      if (selectedCameras.length === 0) {
+        // снимаем одну из "всех" → выбираем все кроме этой
+        setSelectedCameras(allCams.filter(c => c !== cam));
+      } else {
+        setSelectedCameras(prev => prev.filter(c => c !== cam));
+      }
+    } else {
+      setSelectedCameras(prev => {
+        const next = [...prev, cam];
+        return next.length === allCams.length ? [] : next;
+      });
+    }
+  };
+
+  const camBtnLabel = selectedCameras.length === 0
+    ? `Все камеры (${allCams.length}) ▾`
+    : `Камеры: ${selectedCameras.length}/${allCams.length} ▾`;
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col select-none">
@@ -182,12 +232,33 @@ export default function Statistics() {
           className="w-9 h-9 rounded-full bg-gray-700 hover:bg-gray-600 flex items-center justify-center text-lg shrink-0">←</button>
         <h1 className="text-sm font-bold shrink-0">📊 Статистика</h1>
 
-        <select value={selectedCamera} onChange={e=>{setSelectedCamera(e.target.value);setPageStart(0);}}
-          className="px-2 py-1.5 rounded bg-gray-700 border border-gray-600 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
-          <option value="">Все камеры</option>
-          {allCams.map(c=><option key={c} value={c}>{c}</option>)}
-        </select>
+        {/* Фильтр камер — чекбоксы */}
+        <div className="relative">
+          <button onClick={()=>setShowCamFilter(p=>!p)}
+            className={`px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 border text-sm ${showCamFilter?"border-indigo-500":"border-gray-600"}`}>
+            {camBtnLabel}
+          </button>
+          {showCamFilter&&(
+            <div className="absolute top-full mt-1 left-0 z-50 bg-gray-800 border border-gray-600 rounded-lg shadow-2xl p-3 min-w-56"
+                 onMouseLeave={()=>setShowCamFilter(false)}>
+              <div className="flex gap-3 mb-2">
+                <button onClick={()=>setSelectedCameras([])} className="text-xs text-indigo-400">Все</button>
+              </div>
+              <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5">
+                {allCams.map(cam=>(
+                  <label key={cam} className="flex items-center gap-2 text-sm hover:bg-gray-700 px-2 py-1 rounded cursor-pointer">
+                    <input type="checkbox" checked={isCamChecked(cam)}
+                      onChange={()=>toggleCam(cam)}
+                      className="accent-indigo-500"/>
+                    <span className="truncate">{cam}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
 
+        {/* Фильтр типов */}
         <div className="relative">
           <button onClick={()=>setShowTypeFilter(p=>!p)}
             className={`px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 border text-sm ${showTypeFilter?"border-indigo-500":"border-gray-600"}`}>
@@ -220,7 +291,7 @@ export default function Statistics() {
 
         <div className="flex items-center gap-2">
           <span className="text-xs opacity-50 shrink-0">С:</span>
-          <input type="datetime-local" value={timeFrom} onChange={e=>{setTimeFrom(e.target.value);setPageStart(0);}}
+          <input type="datetime-local" value={timeFrom} onChange={e=>setTimeFrom(e.target.value)}
             className="px-2 py-1 rounded bg-gray-700 border border-gray-600 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
         </div>
 
@@ -231,17 +302,11 @@ export default function Statistics() {
         </div>
       </div>
 
-      {/* Пагинация */}
-      {totalPages>1&&(
-        <div className="flex items-center gap-2 px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm">
-          <button onClick={()=>goPage(0)} disabled={currentPage===0} className="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-30">⟨⟨</button>
-          <button onClick={()=>goPage(currentPage-1)} disabled={currentPage===0} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-30">← Prev</button>
-          <span className="opacity-60 mx-1 text-xs">{currentPage+1} / {totalPages}</span>
-          <button onClick={()=>goPage(currentPage+1)} disabled={currentPage>=totalPages-1} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-30">Next →</button>
-          <button onClick={()=>goPage(totalPages-1)} disabled={currentPage>=totalPages-1} className="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-30">⟩⟩</button>
-          <span className="text-xs opacity-40 ml-1">{pageStart+1}–{Math.min(pageStart+cols,allBuckets.length)} из {allBuckets.length}</span>
-        </div>
-      )}
+      {/* Навигация по времени */}
+      <div className="flex items-center gap-2 px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm">
+        <button onClick={()=>shiftTime(-1)} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600">← Назад</button>
+        <button onClick={()=>shiftTime(1)} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600">Вперёд →</button>
+      </div>
 
       {/* График */}
       <div className="flex-1 flex flex-col p-4 min-h-0 overflow-hidden">
@@ -281,8 +346,15 @@ export default function Statistics() {
             {/* X-метки */}
             <div className="flex ml-10 mt-1 overflow-hidden">
               {pageBuckets.map((b,i)=>(
-                <div key={i} className="flex-1 text-center overflow-hidden" style={{maxWidth:`${100/cols}%`}}>
-                  <span className="text-gray-500" style={{fontSize:Math.min(10,Math.max(6,480/cols))}}>{b.label}</span>
+                <div key={i} className="flex-1 text-center overflow-hidden leading-none" style={{maxWidth:`${100/cols}%`}}>
+                  <div className="text-gray-500" style={{fontSize:Math.min(10,Math.max(6,480/cols))}}>
+                    {fmtBucketLabel(b.ts_from, step)}
+                  </div>
+                  {step<86400&&(
+                    <div className="text-gray-600" style={{fontSize:Math.min(9,Math.max(5,400/cols))}}>
+                      {fmtBucketDate(b.ts_from)}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>

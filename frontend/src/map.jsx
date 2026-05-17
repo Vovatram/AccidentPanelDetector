@@ -222,31 +222,6 @@ useEffect(() => {
     setUser(null);
     localStorage.removeItem('user');
   };
-    useEffect(() => {
-     const F = () => {
-      console.log('->>')
-      let cameras = 'all'
-      let time = 'all'
-      let paramU = false
-      axios.get(`${import.meta.env.VITE_API_URL}/notifications`, {params: {cameras, time, paramU }, headers: {Authorization: `Bearer ${window.accessToken || localStorage.getItem('access_token')}` }})
-      .then(response => {
-          if (response.data){
-            console.log(response.data)
-          }})
-        
-      .catch(error => console.error('Error find:', error));}
-    
-      F()
-    const intervalId = setInterval(() => {
-      F()
-    }, 1000); 
-
-    // Обязательная очистка!
-    return () => {
-      clearInterval(intervalId);
-      console.log("Таймер очищен");
-    };
-  }, [])
 
   // Управление уведомлениями
   const addTestNotification = () => {

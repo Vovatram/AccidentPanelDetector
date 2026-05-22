@@ -17,10 +17,10 @@ load_dotenv()
 
 router = APIRouter()
 
-MAILERSEND_API_TOKEN = os.getenv("MAILERSEND_API_TOKEN")
-MAILERSEND_FROM      = os.getenv("MAILERSEND_FROM")
-MAILERSEND_FROM_NAME = os.getenv("MAILERSEND_FROM_NAME")
-MAILERSEND_API_URL   = "https://api.mailersend.com/v1/email"
+RESEND_API_KEY   = os.getenv("RESEND_API_KEY")
+RESEND_FROM      = os.getenv("RESEND_FROM", "no-reply@sendem.xyz")
+RESEND_FROM_NAME = os.getenv("RESEND_FROM_NAME", "Accident Detector")
+RESEND_API_URL   = "https://api.resend.com/emails"
 
 TG_BOT_TOKEN    = os.getenv("TG_BOT_TOKEN")
 TG_BOT_USERNAME = "@Accident_DetectorBot"
@@ -123,27 +123,34 @@ def send_telegram(chat_id: str, text: str, photo_path: str | None = None) -> boo
         return False
 
 
-def send_email_sync(email: EmailSchema):
-    import requests as req_lib
+def send_email_sync(email: EmailSchema, photo_path: str | None = None):
+    import requests as req_lib, base64 as _b64
     try:
+        payload = {
+            "from":    f"{RESEND_FROM_NAME} <{RESEND_FROM}>",
+            "to":      [email.to],
+            "subject": email.subject,
+            "text":    email.body,
+        }
+        if photo_path and os.path.exists(photo_path):
+            with open(photo_path, "rb") as f:
+                payload["attachments"] = [{
+                    "filename": os.path.basename(photo_path),
+                    "content":  _b64.b64encode(f.read()).decode(),
+                }]
         resp = req_lib.post(
-            MAILERSEND_API_URL,
+            RESEND_API_URL,
             headers={
-                "Authorization": f"Bearer {MAILERSEND_API_TOKEN}",
+                "Authorization": f"Bearer {RESEND_API_KEY}",
                 "Content-Type":  "application/json",
             },
-            json={
-                "from": {"email": MAILERSEND_FROM, "name": MAILERSEND_FROM_NAME},
-                "to":   [{"email": email.to}],
-                "subject": email.subject,
-                "text":    email.body,
-            },
+            json=payload,
             timeout=15,
         )
-        if resp.status_code == 202:
+        if resp.status_code == 200:
             print(f"[email] Отправлено на {email.to}")
         else:
-            print(f"[email] Ошибка MailerSend {resp.status_code}: {resp.text}")
+            print(f"[email] Ошибка Resend {resp.status_code}: {resp.text}")
     except Exception as e:
         print(f"[email] Исключение: {e}")
 
@@ -188,7 +195,10 @@ def notify_incident(camera_name: str, incident_type: str,
             if want_email:
                 print('Попытка отправить письмо')
                 try:
-                    send_email_sync(EmailSchema(to=user.email, subject=subject, body=body))
+                    send_email_sync(
+                        EmailSchema(to=user.email, subject=subject, body=body),
+                        photo_path=screenshot_path,
+                    )
                 except Exception as e:
                     print(f"[notify] email error {user.email}: {e}")
 
@@ -291,6 +301,29 @@ async def get_site_notifications(
     }
 
 
+@router.post("/user/email-subscriptions")
+async def save_email_subscriptions(
+    data: dict = Body(...),
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    camera_name   = data.get("camera")
+    subscriptions = data.get("subscriptions", [])
+    user = db.query(User).filter(User.email == current_user).first()
+    if not user:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    notifs = dict(user.notifications or {})
+    notifs[f"email:{camera_name}"] = subscriptions
+    user.notifications = notifs
+    flag_modified(user, "notifications")
+    db.commit()
+    return {"ok": True}
+
+
 @router.post("/user/telegram-subscriptions")
 async def save_telegram_subscriptions(
     data: dict = Body(...),
@@ -329,10 +362,13 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
 
     try:
         data = await ws.receive_json()
-        camera_name  = data.get("camera", "")
-        token        = data.get("token")
-        time_range   = int(data.get("time_range", 3600))
-        client_subs  = data.get("subscriptions", [])
+        camera_name     = data.get("camera", "")
+        _cams_init      = data.get("cameras")          # None если ключ не передан
+        cameras_filter  = _cams_init if _cams_init is not None else []
+        cameras_explicit = _cams_init is not None      # True — клиент явно задал список
+        token           = data.get("token")
+        time_range      = int(data.get("time_range", 3600))
+        client_subs     = data.get("subscriptions", [])
 
         current_user = None
         user_subs    = None
@@ -343,12 +379,23 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
             except Exception:
                 pass
 
-        tg_subs_init = None
+        tg_subs_init    = None
+        email_subs_init = None
         if current_user:
             user = db.query(User).filter(User.email == current_user).first()
             if user and user.notifications:
-                user_subs    = user.notifications.get(camera_name)
-                tg_subs_init = user.notifications.get(f"tg:{camera_name}")
+                notifs = user.notifications
+                if camera_name == '':
+                    # Объединение подписок "На сайте" со всех камер (для "Персональные" на карте)
+                    all_subs: set = set()
+                    for k, v in notifs.items():
+                        if not k.startswith('tg:') and not k.startswith('email:') and isinstance(v, list):
+                            all_subs.update(v)
+                    user_subs = list(all_subs) if all_subs else None
+                else:
+                    user_subs = notifs.get(camera_name)
+                tg_subs_init    = notifs.get(f"tg:{camera_name}")
+                email_subs_init = notifs.get(f"email:{camera_name}")
 
         subscriptions = user_subs if user_subs is not None else client_subs
         subs_explicit = user_subs is not None
@@ -358,6 +405,7 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
             "authenticated":          bool(current_user),
             "subscriptions":          subscriptions,
             "telegram_subscriptions": tg_subs_init,
+            "email_subscriptions":    email_subs_init,
         })
 
         last_incident_id = 0
@@ -381,12 +429,22 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
                 for i in incidents_list
             ]
 
+        def _build_query(since, last_id=None):
+            q = db.query(Incident).filter(Incident.date >= since)
+            if cameras_explicit:
+                if cameras_filter:
+                    q = q.filter(Incident.camera.in_(cameras_filter))
+                else:
+                    q = q.filter(Incident.id == -1)    # явно пустой список → ничего
+            elif camera_name:
+                q = q.filter(Incident.camera == camera_name)
+            if last_id is not None:
+                q = q.filter(Incident.id > last_id)
+            return q.order_by(Incident.id.asc())
+
         try:
             since_init = datetime.now(timezone.utc) - timedelta(seconds=time_range)
-            history = db.query(Incident).filter(
-                Incident.camera == camera_name,
-                Incident.date   >= since_init,
-            ).order_by(Incident.id.asc()).all()
+            history = _build_query(since_init).all()
 
             if history:
                 last_incident_id = history[-1].id
@@ -419,10 +477,7 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
                                 db.rollback()
                         try:
                             since_upd = datetime.now(timezone.utc) - timedelta(seconds=time_range)
-                            hist_upd  = db.query(Incident).filter(
-                                Incident.camera == camera_name,
-                                Incident.date   >= since_upd,
-                            ).order_by(Incident.id.asc()).all()
+                            hist_upd  = _build_query(since_upd).all()
                             if hist_upd:
                                 last_incident_id = hist_upd[-1].id
                             filtered_upd = _filter_by_subs(hist_upd, subscriptions, subs_explicit)
@@ -436,25 +491,33 @@ async def notifications_stream(ws: WebSocket, db: Session = Depends(get_db)):
                         time_range       = int(msg.get("time_range", time_range))
                         last_incident_id = 0
                         since_new        = datetime.now(timezone.utc) - timedelta(seconds=time_range)
-                        history          = db.query(Incident).filter(
-                            Incident.camera == camera_name,
-                            Incident.date   >= since_new,
-                        ).order_by(Incident.id.asc()).all()
+                        history          = _build_query(since_new).all()
                         if history:
                             last_incident_id = history[-1].id
                         filtered = _filter_by_subs(history, subscriptions, subs_explicit)
                         await ws.send_json({"type": "incidents", "reset": True,
                                             "incidents": _serialize(filtered)})
 
+                    elif msg.get("type") == "update_display_filter":
+                        # Фильтр из Настройки ленты — в памяти, не в БД; пустой = ничего не показывать
+                        subscriptions    = msg.get("subscriptions", [])
+                        cameras_filter   = msg.get("cameras", [])
+                        cameras_explicit = True
+                        subs_explicit    = True
+                        last_incident_id = 0
+                        since_df = datetime.now(timezone.utc) - timedelta(seconds=time_range)
+                        hist_df  = _build_query(since_df).all()
+                        if hist_df:
+                            last_incident_id = hist_df[-1].id
+                        filtered_df = _filter_by_subs(hist_df, subscriptions, subs_explicit)
+                        await ws.send_json({"type": "incidents", "reset": True,
+                                            "incidents": _serialize(filtered_df)})
+
                 except asyncio.TimeoutError:
                     pass
 
-                since        = datetime.now(timezone.utc) - timedelta(seconds=time_range)
-                new_incidents = db.query(Incident).filter(
-                    Incident.camera == camera_name,
-                    Incident.date   >= since,
-                    Incident.id     >  last_incident_id,
-                ).order_by(Incident.id.asc()).all()
+                since         = datetime.now(timezone.utc) - timedelta(seconds=time_range)
+                new_incidents = _build_query(since, last_id=last_incident_id).all()
 
                 if new_incidents:
                     last_incident_id = new_incidents[-1].id

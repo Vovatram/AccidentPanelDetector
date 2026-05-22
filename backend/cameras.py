@@ -607,6 +607,14 @@ async def _camera_watchdog():
 
 # ── API routes ────────────────────────────────────────────────────────────────
 
+@router.get("/cameras/status")
+def get_cameras_status(db: Session = Depends(get_db)):
+    result = {}
+    for cam in db.query(Camera):
+        result[cam.name] = cam.id in _running_camera_ids
+    return result
+
+
 @router.websocket("/ws")
 async def video_stream(ws: WebSocket, db: Session = Depends(get_db)):
     global camera_tasks_started

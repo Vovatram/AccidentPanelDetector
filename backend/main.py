@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from models import SessionLocal, User, Camera, _get_camera_incidents
+from models import SessionLocal, User, Camera, _get_camera_incidents, run_migrations
 from cameras import (
     camera_states, _running_camera_ids,
     _start_camera_worker, _camera_watchdog,
@@ -69,6 +69,8 @@ app.include_router(routers_module.router)
 @app.on_event("startup")
 async def startup():
     global camera_tasks_started
+
+    run_migrations()
 
     db = SessionLocal()
     try:

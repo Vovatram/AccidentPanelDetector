@@ -21,7 +21,7 @@ CAMERA_ZONES_REFRESH_INTERVAL = 10
 INCIDENTS_PHOTOS_DIR          = "incidents"
 SAVE_INCIDENT_SCREENSHOTS     = True
 
-DATABASE_URL = "postgresql://postgres:Metro1935)@localhost:5433/apd"
+DATABASE_URL = "postgresql://postgres:Metro1935)@localhost:5432/apd"
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -58,6 +58,8 @@ class User(Base):
     notifications    = Column(JSONB, default=dict)
     telegram         = Column(String(255), nullable=True)
     telegram_chat_id = Column(String(255), nullable=True)
+    email_verified   = Column(String(64), nullable=True)   # 'true' | None
+    email_verify_code = Column(String(64), nullable=True)
 
     def __repr__(self):
         return f"<User email={self.email}>"
@@ -163,6 +165,23 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         return False
     except (JWTError, AttributeError, Exception):
         return False
+
+
+def run_migrations():
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text as _text
+        for sql in [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified VARCHAR(64)",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_code VARCHAR(64)",
+        ]:
+            db.execute(_text(sql))
+        db.commit()
+    except Exception as e:
+        print(f"[migrations] {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 
 def create_access_token(data: dict):

@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route, useNavigate, useParams } from 'react-router-dom';
 import Enter from './Enter.jsx';
-import YandexMapDirect from './map.jsx';
+import YandexMapDirect from './map2.jsx';
 import App from './App.jsx';
 //import Camera from './camera.jsx';
 import Camera from './camera3.jsx';
@@ -20,9 +20,8 @@ function Base() {
   return (
     <BrowserRouter >
       <Routes>
-        <Route path="/" element={<Enter param = {param}/>} />
         <Route path="/camera/:name" element={<Camera theme = 'light'/>} />
-        <Route path="/:numb" element={<YandexMapDirect theme = 'light'/>} />
+        <Route path="/" element={<YandexMapDirect theme = 'light'/>} />
         <Route path="/camera/:name/zones" element={<CameraEditor />} />
         <Route path="/statistics"         element={<Statistics />} />
         <Route path="/statistics/:camera" element={<Statistics />} />

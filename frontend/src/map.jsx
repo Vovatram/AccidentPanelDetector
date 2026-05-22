@@ -5,44 +5,102 @@ import deepEqual from 'fast-deep-equal';
 import { createPortal } from 'react-dom';
 import CameraEditor from "./CameraEditor";
 
+const INCIDENT_TYPES = [
+  'Стоянка в неположенном месте', 'ДТП', 'Превышение скорости',
+  'Пешеход в неположенном месте', 'Затор', 'Движение по встречке', 'Сбитие пешехода'
+];
+
+const EVENT_COLORS = {
+  'ДТП':                          '#ef4444',
+  'Сбитие пешехода':              '#ef4444',
+  'Превышение скорости':          '#facc15',
+  'Затор':                        '#f59e0b',
+  'Движение по встречке':         '#a855f7',
+  'Пешеход в неположенном месте': '#3b82f6',
+  'Стоянка в неположенном месте': '#6b7280',
+};
+
+const TIME_RANGE_OPTIONS = [
+  { label: '15 мин', value: 900 },
+  { label: '1 час',  value: 3600 },
+  { label: '6 часов',value: 21600 },
+  { label: '24 часа',value: 86400 },
+];
+
 // ========== Компонент уведомлений ==========
-const NotificationBell = ({ notifications, onMarkRead, onDelete, onOpenSettings }) => {
+const NotificationBell = ({ notifications, onMarkRead, onDelete, onOpenSettings, timeRange, onTimeRangeChange }) => {
   const [expanded, setExpanded] = useState(false);
   const unreadCount = notifications.filter(n => !n.read).length;
 
   return (
     <div style={{ position: 'fixed', top: 80, right: 20, zIndex: 1100 }}>
-      <div style={{ background: '#1e1e1e', borderRadius: 12, boxShadow: '0 4px 12px rgba(0,0,0,0.3)' }}>
+      <div style={{ background: '#1e1e1e', borderRadius: 12, boxShadow: '0 4px 12px rgba(0,0,0,0.3)', color: 'white' }}>
+
+        {/* Шапка: колокольчик + счётчик + кнопки */}
         <div style={{ display: 'flex', alignItems: 'center', padding: '8px 12px', gap: 8 }}>
-          <span role="img" aria-label="notifications" style={{ fontSize: 24 }}>🔔</span>
+          <span style={{ fontSize: 24 }}>📢</span>
           {unreadCount > 0 && (
             <span style={{ background: 'red', borderRadius: 20, padding: '2px 8px', color: 'white', fontSize: 12 }}>
               {unreadCount}
             </span>
           )}
-          <button onClick={() => setExpanded(!expanded)} style={{ background: 'none', border: 'none', color: 'white', fontSize: 20, cursor: 'pointer' }}>
+          <button onClick={() => setExpanded(p => !p)}
+            style={{ background: 'none', border: 'none', color: 'white', fontSize: 20, cursor: 'pointer' }}>
             {expanded ? '▲' : '▼'}
           </button>
-          <button onClick={onOpenSettings} style={{ background: 'none', border: 'none', color: 'white', fontSize: 20, cursor: 'pointer' }}>⚙️</button>
+          <button onClick={onOpenSettings}
+            style={{ background: 'none', border: 'none', color: 'white', fontSize: 20, cursor: 'pointer' }}>⚙️</button>
         </div>
+
         {expanded && (
-          <div style={{ maxHeight: 400, overflowY: 'auto', padding: 8, minWidth: 300 }}>
-            {notifications.length === 0 && <div style={{ color: '#aaa', textAlign: 'center' }}>Нет уведомлений</div>}
-            {notifications.map(notif => (
-              <div key={notif.id} style={{ marginBottom: 8, padding: 8, borderRadius: 8, background: notif.read ? '#2a2a2a' : '#3a3a3a', borderLeft: `4px solid ${notif.color || '#ccc'}` }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <strong>{notif.cameraName}</strong>
-                  <button onClick={() => onDelete(notif.id)} style={{ background: 'none', border: 'none', color: '#ff8888', cursor: 'pointer', fontSize: 16 }}>✕</button>
-                </div>
-                <div style={{ fontSize: 12 }}>{notif.eventType}</div>
-                <div style={{ fontSize: 10, color: '#aaa' }}>{new Date(notif.date).toLocaleString()}</div>
-                {!notif.read && (
-                  <button onClick={() => onMarkRead(notif.id)} style={{ fontSize: 10, marginTop: 4, background: '#555', border: 'none', borderRadius: 4, padding: '2px 6px', cursor: 'pointer' }}>
-                    Отметить прочитанным
+          <div style={{ minWidth: 300, padding: '0 8px 8px' }}>
+
+            {/* Промежуток */}
+            <div style={{ marginBottom: 8 }}>
+              <span style={{ fontSize: 11, color: '#aaa', display: 'block', marginBottom: 4 }}>Промежуток:</span>
+              <div style={{ display: 'flex', gap: 4 }}>
+                {TIME_RANGE_OPTIONS.map(o => (
+                  <button key={o.value} onClick={() => onTimeRangeChange(o.value)}
+                    style={{
+                      flex: 1, padding: '4px 0', borderRadius: 6, fontSize: 11, border: 'none', cursor: 'pointer',
+                      background: timeRange === o.value ? '#4f46e5' : '#333',
+                      color: timeRange === o.value ? 'white' : '#ccc',
+                      fontWeight: timeRange === o.value ? 600 : 400,
+                    }}>
+                    {o.label}
                   </button>
-                )}
+                ))}
               </div>
-            ))}
+            </div>
+
+            {/* Список */}
+            <div style={{ maxHeight: 360, overflowY: 'auto' }}>
+              {notifications.length === 0 ? (
+                <div style={{ color: '#aaa', textAlign: 'center', padding: '24px 0', fontSize: 13 }}>
+                  Нет уведомлений
+                </div>
+              ) : notifications.map(notif => (
+                <div key={notif.id} style={{
+                  marginBottom: 8, padding: 8, borderRadius: 8,
+                  background: notif.read ? '#2a2a2a' : '#3a3a3a',
+                  borderLeft: `4px solid ${notif.color || EVENT_COLORS[notif.eventType] || '#ccc'}`
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <strong style={{ fontSize: 13 }}>{notif.cameraName}</strong>
+                    <button onClick={() => onDelete(notif.id)}
+                      style={{ background: 'none', border: 'none', color: '#ff8888', cursor: 'pointer', fontSize: 16 }}>✕</button>
+                  </div>
+                  <div style={{ fontSize: 12, marginTop: 2 }}>{notif.eventType}</div>
+                  <div style={{ fontSize: 10, color: '#aaa', marginTop: 2 }}>{new Date(notif.date).toLocaleString()}</div>
+                  {!notif.read && (
+                    <button onClick={() => onMarkRead(notif.id)}
+                      style={{ fontSize: 10, marginTop: 4, background: '#555', border: 'none', borderRadius: 4, padding: '2px 6px', cursor: 'pointer', color: 'white' }}>
+                      Отметить прочитанным
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </div>
@@ -54,28 +112,100 @@ const NotificationBell = ({ notifications, onMarkRead, onDelete, onOpenSettings 
 const SettingsPanel = ({ onClose, filters, setFilters, camerasList }) => {
   const [tempFilters, setTempFilters] = useState(filters);
 
+  const toggleCamera = (cam) => {
+    const isSelected = tempFilters.cameras.includes(cam);
+    let next;
+    if (tempFilters.cameras.length === 0) {
+      next = camerasList.filter(c => c !== cam);
+    } else if (isSelected) {
+      next = tempFilters.cameras.filter(c => c !== cam);
+    } else {
+      next = [...tempFilters.cameras, cam];
+    }
+    if (next.length === camerasList.length) next = [];
+    setTempFilters({ ...tempFilters, cameras: next });
+  };
+
+  const toggleEventType = (type) => {
+    const isSelected = tempFilters.eventTypes.includes(type);
+    let next;
+    if (tempFilters.eventTypes.length === 0) {
+      next = INCIDENT_TYPES.filter(t => t !== type);
+    } else if (isSelected) {
+      next = tempFilters.eventTypes.filter(t => t !== type);
+    } else {
+      next = [...tempFilters.eventTypes, type];
+    }
+    if (next.length === INCIDENT_TYPES.length) next = [];
+    setTempFilters({ ...tempFilters, eventTypes: next });
+  };
+
   return (
-    <div style={{ position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', background: '#2c2c2c', borderRadius: 16, padding: 20, zIndex: 1200, minWidth: 300, color: 'white', boxShadow: '0 8px 24px black' }}>
-      <h3>Настройки уведомлений</h3>
-      <label>Период (часов):</label>
-      <input type="number" value={tempFilters.periodHours} onChange={e => setTempFilters({ ...tempFilters, periodHours: parseInt(e.target.value) || 24 })} style={{ width: '100%', marginBottom: 12 }} />
-      
-      <label>Камеры:</label>
-      <select multiple value={tempFilters.cameras} onChange={e => setTempFilters({ ...tempFilters, cameras: Array.from(e.target.selectedOptions, o => o.value) })} style={{ width: '100%', marginBottom: 12 }}>
-        {camerasList.map(cam => <option key={cam} value={cam}>{cam}</option>)}
-      </select>
-      
-      <label>Типы событий:</label>
-      <select multiple value={tempFilters.eventTypes} onChange={e => setTempFilters({ ...tempFilters, eventTypes: Array.from(e.target.selectedOptions, o => o.value) })} style={{ width: '100%', marginBottom: 12 }}>
-        <option value="accident">ДТП</option>
-        <option value="fire">Пожар</option>
-        <option value="smoke">Дым</option>
-        <option value="other">Другое</option>
-      </select>
-      
+    <div style={{
+      position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+      background: '#2c2c2c', borderRadius: 16, padding: 24, zIndex: 1200,
+      minWidth: 320, maxWidth: 400, color: 'white',
+      boxShadow: '0 8px 32px rgba(0,0,0,0.8)', border: '1px solid #444',
+      maxHeight: '85vh', overflowY: 'auto', boxSizing: 'border-box'
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <h3 style={{ margin: 0 }}>Настройки ленты</h3>
+        <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'white', cursor: 'pointer', fontSize: 18 }}>✕</button>
+      </div>
+
+      {/* Камеры в ленте — чекбоксы, множественный выбор */}
+      <div style={{ marginBottom: 16 }}>
+        <label style={{ fontSize: 13, color: '#aaa', display: 'block', marginBottom: 6 }}>Камеры в ленте:</label>
+        <div style={{
+          maxHeight: 130, overflowY: 'auto', padding: 10,
+          background: '#1e1e1e', borderRadius: 8, border: '1px solid #444',
+          display: 'flex', flexDirection: 'column', gap: 8
+        }}>
+          {camerasList.map(cam => (
+            <label key={cam} style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 13 }}>
+              <input type="checkbox"
+                checked={tempFilters.cameras.length === 0 || tempFilters.cameras.includes(cam)}
+                onChange={() => toggleCamera(cam)}
+              />
+              <span>{cam}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {/* Типы событий — чекбоксы с цветными метками */}
+      <div style={{ marginBottom: 20 }}>
+        <label style={{ fontSize: 13, color: '#aaa', display: 'block', marginBottom: 6 }}>Типы событий:</label>
+        <div style={{
+          maxHeight: 190, overflowY: 'auto', padding: 10,
+          background: '#1e1e1e', borderRadius: 8, border: '1px solid #444',
+          display: 'flex', flexDirection: 'column', gap: 8
+        }}>
+          {INCIDENT_TYPES.map(type => (
+            <label key={type} style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 13 }}>
+              <input type="checkbox"
+                checked={tempFilters.eventTypes.length === 0 || tempFilters.eventTypes.includes(type)}
+                onChange={() => toggleEventType(type)}
+              />
+              <span style={{
+                display: 'inline-block', width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
+                background: EVENT_COLORS[type] || '#6b7280'
+              }} />
+              <span>{type}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
       <div style={{ display: 'flex', gap: 12 }}>
-        <button onClick={() => { setFilters(tempFilters); onClose(); }} style={{ background: '#4caf50', border: 'none', padding: '8px 16px', borderRadius: 8, cursor: 'pointer' }}>Применить</button>
-        <button onClick={onClose} style={{ background: '#f44336', border: 'none', padding: '8px 16px', borderRadius: 8, cursor: 'pointer' }}>Отмена</button>
+        <button onClick={() => { setFilters(tempFilters); onClose(); }}
+          style={{ flex: 1, background: '#4caf50', color: 'white', border: 'none', padding: 10, borderRadius: 8, cursor: 'pointer', fontWeight: 'bold' }}>
+          Применить
+        </button>
+        <button onClick={onClose}
+          style={{ flex: 1, background: '#444', color: 'white', border: 'none', padding: 10, borderRadius: 8, cursor: 'pointer' }}>
+          Отмена
+        </button>
       </div>
     </div>
   );
@@ -140,7 +270,8 @@ const App = ({ theme: propTheme }) => {
   const [user, setUser] = useState(null);
   const [notifications, setNotifications] = useState([]);
   const [showSettings, setShowSettings] = useState(false);
-  const [filters, setFilters] = useState({ periodHours: 24, cameras: [], eventTypes: [] });
+  const [filters, setFilters] = useState({ cameras: [], eventTypes: [] });
+  const [timeRange, setTimeRange] = useState(3600); // секунды, по умолчанию 1 час
   const [darkTheme, setDarkTheme] = useState(true); // тема карты
   const { numb } = useParams();
   const navigate = useNavigate();
@@ -244,17 +375,12 @@ useEffect(() => {
     setNotifications(prev => prev.filter(n => n.id !== id));
   };
   const getFilteredNotifications = () => {
-    let filtered = notifications;
-    if (filters.periodHours) {
-      const limit = Date.now() - filters.periodHours * 3600000;
-      filtered = filtered.filter(n => new Date(n.date).getTime() > limit);
-    }
-    if (filters.cameras.length > 0) {
+    const limit = Date.now() - timeRange * 1000;
+    let filtered = notifications.filter(n => new Date(n.date).getTime() > limit);
+    if (filters.cameras.length > 0)
       filtered = filtered.filter(n => filters.cameras.includes(n.cameraName));
-    }
-    if (filters.eventTypes.length > 0) {
+    if (filters.eventTypes.length > 0)
       filtered = filtered.filter(n => filters.eventTypes.includes(n.eventType));
-    }
     return filtered;
   };
 
@@ -361,6 +487,8 @@ useEffect(() => {
         onMarkRead={markAsRead}
         onDelete={deleteNotification}
         onOpenSettings={() => setShowSettings(true)}
+        timeRange={timeRange}
+        onTimeRangeChange={setTimeRange}
       />
 
       {/* Настройки */}

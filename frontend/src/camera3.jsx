@@ -54,11 +54,12 @@ function TypeSelector({title, selected, onToggle, onSave, saveLabel, onClose}) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 function AuthModal({onClose, onSuccess, theme}) {
-  const [tab, setTab]   = useState('login');
-  const [email, setEmail] = useState('');
+  const [tab, setTab]       = useState('login');
+  const [email, setEmail]   = useState('');
   const [password, setPassword] = useState('');
-  const [uname, setUname] = useState('');
+  const [uname, setUname]   = useState('');
   const [confirm, setConfirm] = useState('');
+  const [verifyCode, setVerifyCode] = useState('');
   const [error, setError]   = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -78,8 +79,18 @@ function AuthModal({onClose, onSuccess, theme}) {
     setError(''); setLoading(true);
     try {
       await axios.post(`${import.meta.env.VITE_API_URL}/register`, {name:uname, email, password});
-      setTab('login'); setError('Регистрация успешна — войдите');
+      setTab('verify'); setError('Код отправлен на ' + email);
     } catch { setError('Ошибка регистрации'); }
+    finally { setLoading(false); }
+  };
+
+  const handleVerify = async () => {
+    setError(''); setLoading(true);
+    try {
+      const res = await axios.post(`${import.meta.env.VITE_API_URL}/verify-email`, {email, code: verifyCode});
+      if (!res.data.ok) { setError(res.data.error || 'Неверный код'); return; }
+      setTab('login'); setError('Почта подтверждена — войдите');
+    } catch { setError('Ошибка подтверждения'); }
     finally { setLoading(false); }
   };
 
@@ -87,37 +98,63 @@ function AuthModal({onClose, onSuccess, theme}) {
     <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50"
          onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="bg-gray-800 text-white rounded-xl shadow-2xl w-full max-w-sm p-6 border border-gray-600">
-        <div className="flex gap-2 mb-5">
-          {['login','register'].map(t=>(
-            <button key={t} onClick={()=>{setTab(t);setError('');}}
-              className={`flex-1 py-1.5 rounded-lg text-sm font-semibold transition-colors
-                ${tab===t?'bg-indigo-600 text-white':'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
-              {t==='login'?'Вход':'Регистрация'}
+        {tab !== 'verify' && (
+          <div className="flex gap-2 mb-5">
+            {['login','register'].map(t=>(
+              <button key={t} onClick={()=>{setTab(t);setError('');}}
+                className={`flex-1 py-1.5 rounded-lg text-sm font-semibold transition-colors
+                  ${tab===t?'bg-indigo-600 text-white':'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
+                {t==='login'?'Вход':'Регистрация'}
+              </button>
+            ))}
+            <button onClick={onClose} className="ml-auto text-gray-400 hover:text-white px-2">✕</button>
+          </div>
+        )}
+        {tab === 'verify' ? (
+          <div className="space-y-3">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="font-semibold text-sm">✉️ Подтверждение почты</h3>
+              <button onClick={onClose} className="text-gray-400 hover:text-white">✕</button>
+            </div>
+            <p className="text-xs text-gray-300">Введите 6-значный код из письма на <b>{email}</b></p>
+            <input type="text" placeholder="Код из письма" value={verifyCode}
+              onChange={e=>setVerifyCode(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&handleVerify()}
+              maxLength={6}
+              className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 tracking-widest text-center text-lg"/>
+            {error&&<p className={`text-xs ${error.includes('подтверждена')?'text-green-400':'text-red-400'}`}>{error}</p>}
+            <button onClick={handleVerify} disabled={loading||verifyCode.length<6}
+              className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50">
+              {loading?'Проверка...':'Подтвердить'}
             </button>
-          ))}
-          <button onClick={onClose} className="ml-auto text-gray-400 hover:text-white px-2">✕</button>
-        </div>
-        <div className="space-y-3">
-          {tab==='register'&&(
-            <input type="text" placeholder="Имя" value={uname} onChange={e=>setUname(e.target.value)}
+            <button onClick={()=>{setTab('login');setError('Войдите после регистрации');}}
+              className="w-full py-1 text-xs text-gray-400 hover:text-white">
+              Подтвердить позже
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {tab==='register'&&(
+              <input type="text" placeholder="Имя" value={uname} onChange={e=>setUname(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            )}
+            <input type="email" placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)}
+              onKeyDown={e=>tab==='login'&&e.key==='Enter'&&handleLogin()}
               className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-          )}
-          <input type="email" placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)}
-            onKeyDown={e=>tab==='login'&&e.key==='Enter'&&handleLogin()}
-            className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-          <input type="password" placeholder="Пароль" value={password} onChange={e=>setPassword(e.target.value)}
-            onKeyDown={e=>tab==='login'&&e.key==='Enter'&&handleLogin()}
-            className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-          {tab==='register'&&(
-            <input type="password" placeholder="Повторите пароль" value={confirm} onChange={e=>setConfirm(e.target.value)}
+            <input type="password" placeholder="Пароль" value={password} onChange={e=>setPassword(e.target.value)}
+              onKeyDown={e=>tab==='login'&&e.key==='Enter'&&handleLogin()}
               className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
-          )}
-          {error&&<p className={`text-xs ${error.includes('успешна')?'text-green-400':'text-red-400'}`}>{error}</p>}
-          <button onClick={tab==='login'?handleLogin:handleRegister} disabled={loading}
-            className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50">
-            {loading?'Загрузка...':(tab==='login'?'Войти':'Зарегистрироваться')}
-          </button>
-        </div>
+            {tab==='register'&&(
+              <input type="password" placeholder="Повторите пароль" value={confirm} onChange={e=>setConfirm(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            )}
+            {error&&<p className={`text-xs ${error.includes('подтверждена')||error.includes('успешна')?'text-green-400':'text-red-400'}`}>{error}</p>}
+            <button onClick={tab==='login'?handleLogin:handleRegister} disabled={loading}
+              className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold disabled:opacity-50">
+              {loading?'Загрузка...':(tab==='login'?'Войти':'Зарегистрироваться')}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -388,11 +425,13 @@ function Camera() {
         if (msg.type==='connected') {
           setIsAuthenticated(msg.authenticated);
           if (msg.authenticated && msg.subscriptions) {
-            subsFromServerRef.current = true; // не отправлять update_subscriptions в ответ
+            subsFromServerRef.current = true;
             setSiteSubs(msg.subscriptions);
           }
           if (msg.authenticated && msg.telegram_subscriptions != null)
             setTelegramSubs(msg.telegram_subscriptions);
+          if (msg.authenticated && msg.email_subscriptions != null)
+            setEmailSubs(msg.email_subscriptions);
         }
 
         if (msg.type==='incidents') {
@@ -522,6 +561,20 @@ function Camera() {
     setOpenChannel(null);
   };
 
+  const saveEmailSubs = async (subs) => {
+    const token = localStorage.getItem('access_token');
+    if (!token) return;
+    try {
+      await fetch(`${import.meta.env.VITE_API_URL}/user/email-subscriptions`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json', Authorization:`Bearer ${token}`},
+        body: JSON.stringify({camera: name, subscriptions: subs}),
+      });
+      toast('Email-подписки сохранены ✓');
+    } catch { toast('Ошибка сохранения'); }
+    setOpenChannel(null);
+  };
+
   useEffect(() => {
     if (newIncidentIndicator) {
       const t = setTimeout(()=>setNewIncidentIndicator(false),3000);
@@ -551,8 +604,11 @@ function Camera() {
 
   const handleLogout = () => {
     localStorage.removeItem('access_token');
-    setIsAuthenticated(false); setUserName(''); setUserEmail(''); setSiteSubs([]);
+    setIsAuthenticated(false); setUserName(''); setUserEmail('');
+    setSiteSubs([]); setTelegramSubs([]); setEmailSubs([]);
+    setUserTelegram(''); setIsSuperAdmin(false);
     toast('Вы вышли');
+    connectNotifWs();
   };
 
   const filteredIncidents = (() => {
@@ -574,7 +630,7 @@ function Camera() {
         <div className="flex items-center justify-between px-4 py-2 gap-3">
           {/* Левая часть */}
           <div className="flex items-center gap-2">
-            <button onClick={()=>navigate('/map')}
+            <button onClick={()=>navigate('/')}
               className={`w-9 h-9 rounded-full ${T.btn} flex items-center justify-center text-lg hover:scale-105 transition-all`}>←</button>
             <button onClick={()=>navigate(`/statistics/${encodeURIComponent(name)}`)}
               className={`w-9 h-9 rounded-full ${T.btn} flex items-center justify-center hover:scale-105 transition-all`}
@@ -782,7 +838,7 @@ function Camera() {
           </div>
           <div className="p-3 space-y-3">
 
-            {!isAuthenticated ? (
+            {!isAuthenticated  ? (
               <>
                 <div>
                   <div className="flex items-center justify-between mb-1">
@@ -893,9 +949,10 @@ function Camera() {
                       <span className="text-xs opacity-60">{emailSubs.length?`${emailSubs.length} тип.`:'—'}</span>
                     </button>
                     {openChannel==='email'&&(
-                      <TypeSelector title="Email" selected={emailSubs}
+                      <TypeSelector title="Email-уведомления" selected={emailSubs}
                         onToggle={t=>setEmailSubs(p=>p.includes(t)?p.filter(x=>x!==t):[...p,t])}
-                        onClose={()=>setOpenChannel(null)} onSave={()=>setOpenChannel(null)} saveLabel="Готово"/>
+                        onClose={()=>setOpenChannel(null)}
+                        onSave={()=>saveEmailSubs(emailSubs)} saveLabel="Сохранить"/>
                     )}
                   </div>
                 </div>
@@ -910,7 +967,12 @@ function Camera() {
           onSuccess={email=>{
             setIsAuthenticated(true); setUserEmail(email); setUserName(email.split('@')[0]);
             setShowAuthModal(false); toast('Вы вошли ✓');
-            connectNotifWs(); // переподключаемся с токеном
+            connectNotifWs();
+            const token = localStorage.getItem('access_token');
+            fetch(`${import.meta.env.VITE_API_URL}/user/profile`, {headers:{Authorization:`Bearer ${token}`}})
+              .then(r=>r.json()).then(d=>{ if(d.telegram) setUserTelegram(d.telegram); }).catch(()=>{});
+            fetch(`${import.meta.env.VITE_API_URL}/superadmins`)
+              .then(r=>r.json()).then(admins=>{ if(admins.includes(email)) setIsSuperAdmin(true); }).catch(()=>{});
           }}/>
       )}
 

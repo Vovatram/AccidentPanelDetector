@@ -9,6 +9,7 @@ from typing import Dict, Any
 import asyncio
 import pathlib
 import random
+import string
 
 from models import (
     SessionLocal, User, Camera, Incident, SuperAdmin, Data,
@@ -27,7 +28,7 @@ def get_counter(numb, db: Session = Depends(get_db)):
 
 
 @router.get("/cameras")
-def get_cameras(numb, db: Session = Depends(get_db)):
+def get_cameras(db: Session = Depends(get_db)):
     a = {}
     for i in db.query(Camera):
         a[i.name] = [i.coord, i.url]
@@ -73,11 +74,12 @@ async def register_user(data: dict = Body(...), db: Session = Depends(get_db)):
     password = data.get("password")
     print(name, email, password)
     hashed_password = ph.hash(password)
-    print(hashed_password)
+    verify_code = ''.join(random.choices(string.digits, k=6))
     db_user = User(
         name=name,
         email=email,
         password_hash=hashed_password,
+        email_verify_code=verify_code,
     )
     db_data = Data(
         name     = email,
@@ -89,6 +91,34 @@ async def register_user(data: dict = Body(...), db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_user)
     db.refresh(db_data)
+    try:
+        send_email_sync(EmailSchema(
+            to=email,
+            subject="Подтверждение почты — Accident Detector",
+            body=(
+                f"Здравствуйте, {name}!\n\n"
+                f"Ваш код подтверждения: {verify_code}\n\n"
+                "Введите его на сайте для активации аккаунта.\n"
+                "Если вы не регистрировались — проигнорируйте письмо."
+            ),
+        ))
+    except Exception as e:
+        print(f"[register] Ошибка отправки кода: {e}")
+
+
+@router.post("/verify-email")
+async def verify_email(data: dict = Body(...), db: Session = Depends(get_db)):
+    email = data.get("email", "").strip().lower()
+    code  = data.get("code", "").strip()
+    user  = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    if not user.email_verify_code or user.email_verify_code != code:
+        return {"ok": False, "error": "Неверный код"}
+    user.email_verified    = "true"
+    user.email_verify_code = None
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/check-email")

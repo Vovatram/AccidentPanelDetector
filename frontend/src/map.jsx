@@ -502,12 +502,6 @@ useEffect(() => {
       )}
 
       {/* Кнопка тестового уведомления */}
-      <button
-        onClick={addTestNotification}
-        style={{ position: 'fixed', bottom: 20, right: 20, zIndex: 1100, background: '#ff9800', border: 'none', borderRadius: 40, padding: '12px 20px', color: 'white', fontWeight: 'bold', cursor: 'pointer', boxShadow: '0 2px 8px black' }}
-      >
-        📢 Тест уведомления
-      </button>
 
       {/* Боковая панель добавления камер (увеличена кнопка сворачивания) */}
       <button

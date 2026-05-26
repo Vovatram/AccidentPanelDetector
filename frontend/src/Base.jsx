@@ -7,6 +7,7 @@ import Camera from './camera3.jsx';
 import CameraEditor from "./CameraEditor";
 import Statistics   from './Statistics.jsx';
 import IncidentPage from './IncidentPage.jsx';
+import Photos       from './Photos.jsx';
 import { useEffect, useState } from 'react';
 /*
 
@@ -20,12 +21,13 @@ function Base() {
   return (
     <BrowserRouter >
       <Routes>
-        <Route path="/camera/:name" element={<Camera theme = 'light'/>} />
-        <Route path="/" element={<YandexMapDirect theme = 'light'/>} />
+        <Route path="/camera/:name" element={<Camera />} />
+        <Route path="/" element={<YandexMapDirect />} />
         <Route path="/camera/:name/zones" element={<CameraEditor />} />
         <Route path="/statistics"         element={<Statistics />} />
         <Route path="/statistics/:camera" element={<Statistics />} />
         <Route path="/incident/:id"       element={<IncidentPage />} />
+        <Route path="/photos"             element={<Photos />} />
         {/*
         <Route path="/:direct" element={<DirectSchedule />} />
         <Route path="/:direct/:rout" element={<SredstvoDetail />} />

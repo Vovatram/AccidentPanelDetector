@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import axios from 'axios';
 import deepEqual from 'fast-deep-equal';
 import { createPortal } from 'react-dom';
+import useTheme from './useTheme';
 
 
 const INCIDENT_TYPES = [
@@ -256,7 +257,8 @@ const App = ({ theme: propTheme }) => {
   const [coord, setCoord] = useState('');
   const [Nname, setNname] = useState('');
   const [url, setUrl] = useState('');
-  const [rotation, setRotation] = useState(0);
+  const [addCameraModal, setAddCameraModal] = useState(null); // {x, y} or null
+  const isSuperAdminRef = useRef(false);
   const [cameras, setCameras] = useState({
     "Шоссе Энтузиастов Пересечение с 3-м кольцом": [
         [
@@ -289,8 +291,71 @@ const App = ({ theme: propTheme }) => {
   });
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [isSuperAdmin, setIsSuperAdmin] = useState(false);
-  const [darkTheme, setDarkTheme] = useState(true); // тема карты
+  const [_themeVal, _setThemeVal] = useTheme();
+  const darkTheme    = _themeVal === 'dark';
+  const setDarkTheme = val => _setThemeVal(val ? 'dark' : 'light');
   const [cameraStatus, setCameraStatus] = useState({}); // {name: true/false}
+
+  // ── Превью камеры ──────────────────────────────────────────────────────────
+  const [cameraPreview, setCameraPreview] = useState(null); // camera name or null
+  const previewWsRef = useRef(null);
+
+  useEffect(() => {
+    if (previewWsRef.current) {
+      previewWsRef.current.onclose = null;
+      previewWsRef.current.close();
+      previewWsRef.current = null;
+    }
+    if (!cameraPreview) return;
+    if (cameraStatus[cameraPreview] !== true) return;
+    const ws = new WebSocket('ws://localhost:8000/ws');
+    previewWsRef.current = ws;
+    ws.onopen = () => ws.send(JSON.stringify({camera: cameraPreview, filters: ['all'], display_filters: ['all']}));
+    ws.onmessage = event => {
+      if (typeof event.data === 'string') { if (event.data === 'ping') ws.send('pong'); return; }
+      const blob = new Blob([event.data], {type:'image/jpeg'});
+      const url  = URL.createObjectURL(blob);
+      const img  = document.getElementById('map-cam-preview');
+      if (!img) return;
+      img.src = url;
+      img.onload = () => { if (img.dataset.prev) URL.revokeObjectURL(img.dataset.prev); img.dataset.prev = url; };
+    };
+    ws.onerror = () => {};
+    ws.onclose = () => {};
+    return () => { ws.onclose = null; ws.close(); };
+  }, [cameraPreview, cameraStatus]);
+
+  // ── Настройки суперадмина ──────────────────────────────────────────────────
+  const [showSuperSettings, setShowSuperSettings] = useState(false);
+  const [appSettings, setAppSettings] = useState(null);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+
+  const SETTINGS_META = [
+    {key:'incident_save_cooldown',        label:'Задержка уведомлений (сек)',      type:'number', min:10,   max:3600},
+    {key:'camera_zones_refresh_interval', label:'Обновление зон (сек)',            type:'number', min:1,    max:300},
+    {key:'save_incident_screenshots',     label:'Сохранять скриншоты',             type:'bool'},
+    {key:'default_speed_limit_kmh',       label:'Лимит скорости по умолч. (км/ч)', type:'number', min:1,    max:300},
+    {key:'base_px_per_meter',             label:'Пикселей на метр (калибровка)',   type:'number', min:0.1,  max:100, step:0.1},
+    {key:'acc_display_frames',            label:'Кадров отображения ДТП',          type:'number', min:30,   max:900},
+    {key:'watchdog_interval',             label:'Интервал watchdog (сек)',          type:'number', min:5,    max:300},
+  ];
+
+  const loadAppSettings = () => {
+    const token = localStorage.getItem('access_token');
+    fetch(`${import.meta.env.VITE_API_URL}/admin/settings`, {headers:{Authorization:`Bearer ${token}`}})
+      .then(r=>r.json()).then(d=>setAppSettings(d)).catch(()=>{});
+  };
+  const saveAppSettings = () => {
+    if (!appSettings) return;
+    setSettingsSaving(true);
+    const token = localStorage.getItem('access_token');
+    fetch(`${import.meta.env.VITE_API_URL}/admin/settings`, {
+      method:'PATCH',
+      headers:{'Content-Type':'application/json', Authorization:`Bearer ${token}`},
+      body: JSON.stringify(appSettings),
+    }).then(r=>r.json()).then(d=>{if(d.ok) setAppSettings(d.settings);})
+      .catch(()=>{}).finally(()=>setSettingsSaving(false));
+  };
 
   // Уведомления (структура из camera3)
   const [timeRange, setTimeRange] = useState(3600);
@@ -322,7 +387,7 @@ const App = ({ theme: propTheme }) => {
           if (mapRef.current && !mapInstanceRef.current) {
             mapInstanceRef.current = new window.ymaps.Map(mapRef.current, {
               center: [55.751574, 37.573856],
-              zoom: 10,
+              zoom: 11,
             });
             setMapReady(true); // карта готова
           }
@@ -332,16 +397,39 @@ const App = ({ theme: propTheme }) => {
   
       return () => document.body.removeChild(script);
     }, []);
-  // Добавление камеры (с углом поворота)
+
+  // Обработчик правого клика на карте — форма добавления камеры
+  useEffect(() => {
+    if (!mapReady || !mapInstanceRef.current) return;
+    const handler = (e) => {
+      if (!isSuperAdminRef.current) return;
+      const origEvent = e.get('domEvent').originalEvent;
+      origEvent.preventDefault();
+      const coords = e.get('coords');
+      setCoord(`${coords[0].toFixed(6)}, ${coords[1].toFixed(6)}`);
+      setNname('');
+      setUrl('');
+      setAddCameraModal({
+        x: Math.min(origEvent.clientX + 10, window.innerWidth - 360),
+        y: Math.min(origEvent.clientY, window.innerHeight - 260),
+      });
+    };
+    mapInstanceRef.current.events.add('contextmenu', handler);
+    return () => {
+      if (mapInstanceRef.current) mapInstanceRef.current.events.remove('contextmenu', handler);
+    };
+  }, [mapReady]);
+
   const addCam = async () => {
-    if (!coord || !url) return alert('Введите координаты и URL камеры');
+    if (!Nname || !coord || !url) return alert('Введите название, координаты и URL камеры');
     await axios.get(`${import.meta.env.VITE_API_URL}/newcam`, {
-      params: { Nname, coord, url, rotation },
-      headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
+      params: { Nname, coord, url },
+      headers: { Authorization: `Bearer ${localStorage.getItem('access_token')}` },
     });
+    setAddCameraModal(null);
+    setNname('');
     setCoord('');
     setUrl('');
-    setRotation(0);
   };
 
   // Аутентификация (заглушка)
@@ -363,6 +451,7 @@ const App = ({ theme: propTheme }) => {
     setSiteSubs([]);
     setTelegramSubs([]);
     localStorage.removeItem('access_token');
+    setActiveModal(null);
     connectNotifWs();
   };
 
@@ -417,6 +506,7 @@ const App = ({ theme: propTheme }) => {
   useEffect(() => { siteSubsRef.current = siteSubs; }, [siteSubs]);
   useEffect(() => { timeRangeRef.current = timeRange; }, [timeRange]);
   useEffect(() => { isAuthRef.current = isAuthenticated; }, [isAuthenticated]);
+  useEffect(() => { isSuperAdminRef.current = isSuperAdmin; }, [isSuperAdmin]);
 
   const connectNotifWs = useCallback(() => {
     clearTimeout(notifReconnTimer.current);
@@ -645,9 +735,10 @@ const App = ({ theme: propTheme }) => {
     }, 300);
   };
   const getFilteredNotifications = () => {
-    // Камеры и типы событий фильтрует сервер — здесь только временное окно
     const limit = Date.now() - timeRange * 1000;
-    return notifications.filter(n => new Date(n.date).getTime() > limit);
+    return notifications
+      .filter(n => new Date(n.date).getTime() > limit)
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
   };
   // Отображение маркеров камер
   // Отображение маркеров камер
@@ -719,61 +810,7 @@ const App = ({ theme: propTheme }) => {
       );
 
       placemark.events.add('click', () => {
-        // Стили зависят от выбранной тобой темы
-        const bgColor = darkTheme ? '#1e1e1e' : '#ffffff';
-        const textColor = darkTheme ? '#ffffff' : '#1a1a1a';
-        const btnColor = '#3b82f6';
-
-        const balloonContent = `
-          <div style="
-            width: 300px; 
-            background: ${bgColor}; 
-            color: ${textColor}; 
-            border-radius: 16px; 
-            overflow: hidden; 
-            font-family: 'Inter', sans-serif;
-            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1);
-          ">
-            <!-- Превью камеры -->
-            <div style="position: relative; height: 170px; background: #000;">
-              <img src="${streamUrl}" style="width:100%; height:100%; object-fit: cover; opacity: 0.9;" />
-              <div style="
-                position: absolute; top: 10px; left: 10px; 
-                background: rgba(239, 68, 68, 0.8); color: white; 
-                padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold;
-              ">
-                LIVE
-              </div>
-            </div>
-
-            <!-- Контент -->
-            <div style="padding: 16px;">
-              <div style="font-weight: 700; margin-bottom: 4px; font-size: 14px; line-height: 1.2;">
-                ${name}
-              </div>
-              <div style="font-size: 11px; color: #888; margin-bottom: 16px;">
-                ID: ${Math.random().toString(36).substr(2, 9).toUpperCase()} • Онлайн
-              </div>
-
-              <!-- Кнопки -->
-              <div style="display: flex; gap: 8px;">
-                <button 
-                  onclick="window.location.href='/camera/${encodeURIComponent(name)}'"
-                  style="
-                    flex: 1; background: ${btnColor}; color: white; 
-                    border: none; padding: 10px; border-radius: 8px; 
-                    cursor: pointer; font-weight: 600; font-size: 12px;
-                    transition: 0.2s;
-                  ">
-                  Открыть во весь экран
-                </button>
-              </div>
-            </div>
-          </div>
-        `;
-
-        placemark.properties.set({ balloonContent });
-        placemark.balloon.open();
+        setCameraPreview(name);
       });
 
       mapInstanceRef.current.geoObjects.add(placemark);
@@ -842,16 +879,20 @@ const App = ({ theme: propTheme }) => {
           cursor: 'pointer', fontSize: '24px', opacity: activeModal === 'settings' ? 1 : 0.6
         }}>⚙️</div>
 
+        {isSuperAdmin && (
+          <div title="Параметры системы" onClick={() => { setShowSuperSettings(p=>!p); if (!appSettings) loadAppSettings(); }} style={{
+            cursor: 'pointer', fontSize: '22px', opacity: showSuperSettings ? 1 : 0.6
+          }}>🛠️</div>
+        )}
+
         <div title="Статистика" onClick={() => navigate('/statistics')} style={{
           cursor: 'pointer', fontSize: '24px', opacity: 0.6
         }}>📊</div>
 
-        {isSuperAdmin && (
-          <div title="Добавить камеру" onClick={() => activeModal === 'add' ? closeModal() : setActiveModal('add')} style={{
-            cursor: 'pointer', fontSize: '24px', opacity: activeModal === 'add' ? 1 : 0.6
-          }}>➕</div>
-        )}
-        
+        <div title="Фото инцидентов" onClick={() => navigate('/photos')} style={{
+          cursor: 'pointer', fontSize: '24px', opacity: 0.6
+        }}>📷</div>
+
         <div title="Сменить тему" onClick={() => setDarkTheme(!darkTheme)} style={{ 
           marginTop: 'auto', marginBottom: '20px', cursor: 'pointer', fontSize: '20px' 
         }}>
@@ -880,29 +921,18 @@ const App = ({ theme: propTheme }) => {
           {user ? (
             <div>
               <p style={{ marginBottom: '15px' }}>Вы вошли как: <b>{user.username || user.email}</b></p>
-              <button onClick={handleLogout} style={{ 
-                width: '100%', padding: '10px', background: '#ef4444', color: '#fff', 
-                border: 'none', borderRadius: '8px', cursor: 'pointer' 
+              <button onClick={handleLogout} style={{
+                width: '100%', padding: '10px', background: '#ef4444', color: '#fff',
+                border: 'none', borderRadius: '8px', cursor: 'pointer'
               }}>Выйти</button>
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              <input type="text" placeholder="Email" id="auth-email" style={{ 
-                width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #444', 
-                background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000' 
-              }} />
-              <input type="password" placeholder="Пароль" id="auth-pass" style={{ 
-                width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #444', 
-                background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000' 
-              }} />
-              <button onClick={() => {
-                const email = document.getElementById('auth-email').value;
-                const pass = document.getElementById('auth-pass').value;
-                handleLogin(email, pass);
-              }} style={{ 
-                width: '100%', padding: '10px', background: '#4caf50', color: '#fff', 
-                border: 'none', borderRadius: '8px', cursor: 'pointer', marginTop: '5px' 
-              }}>Войти</button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <p style={{ margin: 0, fontSize: 13, color: darkTheme ? '#9ca3af' : '#6b7280' }}>Вы не вошли в аккаунт</p>
+              <button onClick={() => { closeModal(); setShowAuthModal(true); }} style={{
+                width: '100%', padding: '10px', background: '#4f46e5', color: '#fff',
+                border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600
+              }}>Войти / Зарегистрироваться</button>
             </div>
           )}
         </div>
@@ -1105,53 +1135,45 @@ const App = ({ theme: propTheme }) => {
         </div>
       )}
 
-      {/* МОДАЛЬНОЕ ОКНО: Добавление камеры (перенесено из старой панели) */}
-        {activeModal === 'add' && (
-        <div style={{ 
-          position: 'fixed', left: '80px', top: '20px', 
-          width: 'min(350px, calc(100vw - 100px))', // Адаптивная ширина
-          maxHeight: 'calc(100vh - 40px)', // Ограничение по высоте экрана
-          background: darkTheme ? '#1e1e1e' : '#fff', color: darkTheme ? '#fff' : '#000',
-          borderRadius: '16px', padding: '20px', zIndex: 1500, boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
+      {/* Форма добавления камеры по правому клику */}
+      {addCameraModal && (
+        <div style={{
+          position: 'fixed',
+          left: addCameraModal.x,
+          top: addCameraModal.y,
+          width: 340,
+          background: darkTheme ? '#1e1e1e' : '#fff',
+          color: darkTheme ? '#fff' : '#000',
+          borderRadius: '16px', padding: '20px', zIndex: 2500,
+          boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
           border: `1px solid ${darkTheme ? '#333' : '#ddd'}`,
           display: 'flex', flexDirection: 'column',
-          overflowY: 'auto', // ВКЛЮЧАЕТ СКРОЛЛ (тот самый слайдер)
           boxSizing: 'border-box',
-          animation: isClosing ? 'modalSlideOut 0.3s ease-in forwards' : 'modalSlideIn 0.3s ease-out forwards'
         }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '15px' }}>
-            <h3 style={{ margin: 0 }}>Новая камера</h3>
-            <button onClick={closeModal} style={{ background: 'none', border: 'none', color: darkTheme ? '#fff' : '#000', cursor: 'pointer', fontSize: '18px' }}>✕</button>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+            <h3 style={{ margin: 0, fontSize: 15 }}>📷 Новая камера</h3>
+            <button onClick={() => setAddCameraModal(null)} style={{ background: 'none', border: 'none', color: darkTheme ? '#fff' : '#000', cursor: 'pointer', fontSize: '18px' }}>✕</button>
           </div>
-          <input type="text" placeholder="Название" value={Nname} onChange={e => setNname(e.target.value)} style={{ 
-            width: '100%', marginBottom: '10px', padding: '8px', borderRadius: '6px', 
-            background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000', border: '1px solid #444' 
+          <input type="text" placeholder="Название" value={Nname} onChange={e => setNname(e.target.value)} style={{
+            width: '100%', marginBottom: '10px', padding: '8px', borderRadius: '6px',
+            background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000', border: '1px solid #444', boxSizing: 'border-box'
           }} />
-          <input type="text" placeholder="Координаты (lat,lng)" value={coord} onChange={e => setCoord(e.target.value)} style={{ 
-            width: '100%', marginBottom: '10px', padding: '8px', borderRadius: '6px', 
-            background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000', border: '1px solid #444' 
+          <input type="text" placeholder="Координаты" value={coord} readOnly style={{
+            width: '100%', marginBottom: '10px', padding: '8px', borderRadius: '6px',
+            background: darkTheme ? '#333' : '#e8e8e8', color: darkTheme ? '#aaa' : '#555', border: '1px solid #444', boxSizing: 'border-box', cursor: 'default'
           }} />
-          <input type="text" placeholder="URL потока" value={url} onChange={e => setUrl(e.target.value)} style={{ 
-            width: '100%', marginBottom: '10px', padding: '8px', borderRadius: '6px', 
-            background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000', border: '1px solid #444' 
+          <input type="text" placeholder="URL потока" value={url} onChange={e => setUrl(e.target.value)} style={{
+            width: '100%', marginBottom: '15px', padding: '8px', borderRadius: '6px',
+            background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000', border: '1px solid #444', boxSizing: 'border-box'
           }} />
-          <input type="number" placeholder="Угол поворота" value={rotation} onChange={e => setRotation(parseInt(e.target.value))} style={{ 
-            width: '100%', marginBottom: '15px', padding: '8px', borderRadius: '6px', 
-            background: darkTheme ? '#2a2a2a' : '#f0f0f0', color: darkTheme ? '#fff' : '#000', border: '1px solid #444' 
-          }} />
-          <button onClick={addCam} style={{ 
-            width: '100%', padding: '10px', background: '#4caf50', color: '#fff', 
-            border: 'none', borderRadius: '8px', cursor: 'pointer' 
+          <button onClick={addCam} style={{
+            width: '100%', padding: '10px', background: '#4caf50', color: '#fff',
+            border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 600
           }}>Добавить на карту</button>
         </div>
       )}
 
       {/* Кнопка тестового уведомления (оставляем для отладки) */}
-      <button onClick={addTestNotification} style={{ 
-        position: 'fixed', bottom: '20px', right: '20px', zIndex: 1100, 
-        background: '#ff9800', border: 'none', borderRadius: '40px', padding: '12px 20px', 
-        color: 'white', fontWeight: 'bold', cursor: 'pointer', boxShadow: '0 2px 8px black' 
-      }}>📢 Тест</button>
 
             {/* КОНТЕЙНЕР ДЛЯ ВСПЛЫВАШЕК (п. 8 ТЗ) */}
       <div style={{ 
@@ -1215,6 +1237,100 @@ const App = ({ theme: propTheme }) => {
               .catch(() => {});
           }}
         />
+      )}
+
+      {/* ── Превью камеры ── */}
+      {cameraPreview && (
+        <div style={{
+          position:'fixed', right:20, bottom:20, zIndex:3000, width:340,
+          background: darkTheme?'#1e1e1e':'#fff', borderRadius:16,
+          boxShadow:'0 8px 32px rgba(0,0,0,0.4)', border:`1px solid ${darkTheme?'#333':'#ddd'}`,
+          overflow:'hidden', fontFamily:'Inter,sans-serif',
+        }}>
+          <div style={{position:'relative', height:192, background:'#000'}}>
+            {cameraStatus[cameraPreview] === true ? (
+              <>
+                <img id="map-cam-preview" style={{width:'100%',height:'100%',objectFit:'cover'}} alt="Камера"/>
+                <div style={{position:'absolute',top:8,left:8,background:'rgba(239,68,68,0.85)',
+                  color:'#fff',padding:'2px 8px',borderRadius:4,fontSize:10,fontWeight:700}}>LIVE</div>
+              </>
+            ) : (
+              <div style={{width:'100%',height:'100%',display:'flex',flexDirection:'column',
+                alignItems:'center',justifyContent:'center',gap:8,color:'#888'}}>
+                <span style={{fontSize:32}}>📷</span>
+                <span style={{fontSize:13}}>Трансляция отключена</span>
+              </div>
+            )}
+            <button onClick={()=>setCameraPreview(null)} style={{
+              position:'absolute',top:6,right:8,background:'rgba(0,0,0,0.5)',border:'none',
+              color:'#fff',cursor:'pointer',fontSize:16,borderRadius:4,padding:'0 6px',lineHeight:'22px'
+            }}>✕</button>
+          </div>
+          <div style={{padding:'12px 16px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <span style={{fontWeight:600,fontSize:13,color:darkTheme?'#fff':'#111',flex:1,minWidth:0,
+              overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{cameraPreview}</span>
+            <button onClick={()=>{ window.location.href=`/camera/${encodeURIComponent(cameraPreview)}`; }}
+              style={{marginLeft:10,padding:'6px 12px',background:'#3b82f6',color:'#fff',border:'none',
+                borderRadius:8,cursor:'pointer',fontSize:12,fontWeight:600,whiteSpace:'nowrap'}}>
+              Полный экран
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Панель настроек суперадмина ── */}
+      {showSuperSettings && isSuperAdmin && (
+        <div style={{
+          position:'fixed', left:80, top:20, width:'min(380px,calc(100vw - 100px))',
+          maxHeight:'calc(100vh - 40px)', overflowY:'auto',
+          background:darkTheme?'#1e1e1e':'#fff', color:darkTheme?'#fff':'#111',
+          borderRadius:16, padding:20, zIndex:2500,
+          boxShadow:'0 8px 32px rgba(0,0,0,0.35)',
+          border:`1px solid ${darkTheme?'#333':'#ddd'}`,
+          boxSizing:'border-box',
+        }}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+            <h3 style={{margin:0,fontSize:15}}>🛠️ Параметры системы</h3>
+            <button onClick={()=>setShowSuperSettings(false)}
+              style={{background:'none',border:'none',color:darkTheme?'#fff':'#111',cursor:'pointer',fontSize:18}}>✕</button>
+          </div>
+          {!appSettings ? (
+            <div style={{textAlign:'center',opacity:0.5,padding:'20px 0'}}>Загрузка...</div>
+          ) : (
+            <div style={{display:'flex',flexDirection:'column',gap:12}}>
+              {SETTINGS_META.map(({key,label,type,min,max,step=1})=>(
+                <div key={key}>
+                  <label style={{display:'block',fontSize:12,opacity:0.6,marginBottom:4}}>{label}</label>
+                  {type==='bool' ? (
+                    <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer'}}>
+                      <input type="checkbox"
+                        checked={!!appSettings[key]}
+                        onChange={e=>setAppSettings(p=>({...p,[key]:e.target.checked}))}
+                        style={{width:16,height:16,accentColor:'#6366f1'}}/>
+                      <span style={{fontSize:13}}>{appSettings[key]?'Включено':'Выключено'}</span>
+                    </label>
+                  ) : (
+                    <input type="number" min={min} max={max} step={step}
+                      value={appSettings[key]??''}
+                      onChange={e=>setAppSettings(p=>({...p,[key]:Number(e.target.value)}))}
+                      style={{
+                        width:'100%', padding:'7px 10px', borderRadius:8, fontSize:13,
+                        border:`1px solid ${darkTheme?'#444':'#ccc'}`,
+                        background:darkTheme?'#2a2a2a':'#f5f5f5',
+                        color:darkTheme?'#fff':'#111', boxSizing:'border-box',
+                        outline:'none',
+                      }}/>
+                  )}
+                </div>
+              ))}
+              <button onClick={saveAppSettings} disabled={settingsSaving}
+                style={{marginTop:8,padding:'10px',background:'#6366f1',color:'#fff',border:'none',
+                  borderRadius:10,cursor:'pointer',fontWeight:700,fontSize:14,opacity:settingsSaving?0.6:1}}>
+                {settingsSaving?'Сохранение...':'Сохранить'}
+              </button>
+            </div>
+          )}
+        </div>
       )}
 
       {/* СТИЛИ ДЛЯ АНИМАЦИЙ */}

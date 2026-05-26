@@ -5,6 +5,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from PIL import ImageFont, ImageDraw, Image as PILImage
 from ultralytics import YOLO
 from datetime import datetime, timezone
+from collections import deque
 import numpy as np
 import cv2
 import asyncio
@@ -12,8 +13,22 @@ import math
 import time
 import os
 
+SPEED_LIMIT_KMH    = 60.0
+BASE_PX_PER_METER  = 7.5
+ACC_DISPLAY_FRAMES = 270
+
+# BGR цвета инцидентов (OpenCV использует BGR, пользователь задал RGB)
+INC_COLORS = {
+    "traffic_jam":  (0,   255, 247),   # RGB 247,255,0
+    "illegal_stop": (118,   0, 255),   # RGB 255,0,118
+    "pedestrian":   (255,  39,   0),   # RGB 0,39,255
+    "accident":     (37,    0, 237),   # RGB 237,0,37
+    "wrong_way":    (220,   0, 255),   # RGB 255,0,220
+    "speeding":     (0,   120, 255),   # RGB 255,120,0
+}
+
 from models import (
-    SessionLocal, Camera, Incident, SuperAdmin,
+    SessionLocal, Camera, Incident, SuperAdmin, AppSettings,
     get_db, get_current_user,
     _get_camera_incidents, _set_camera_incidents,
     INCIDENTS_PHOTOS_DIR, INCIDENT_SAVE_COOLDOWN,
@@ -28,6 +43,29 @@ try:
     _FONT = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 16)
 except OSError:
     _FONT = ImageFont.load_default()
+
+# ── Динамические настройки (загружаются из БД) ────────────────────────────────
+_app_settings: dict = {
+    "incident_save_cooldown":        INCIDENT_SAVE_COOLDOWN,
+    "camera_zones_refresh_interval": CAMERA_ZONES_REFRESH_INTERVAL,
+    "save_incident_screenshots":     SAVE_INCIDENT_SCREENSHOTS,
+    "default_speed_limit_kmh":       SPEED_LIMIT_KMH,
+    "base_px_per_meter":             BASE_PX_PER_METER,
+    "acc_display_frames":            ACC_DISPLAY_FRAMES,
+    "watchdog_interval":             30,
+}
+
+def _load_app_settings():
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text as _t
+        row = db.execute(_t("SELECT settings FROM app_settings ORDER BY id LIMIT 1")).fetchone()
+        if row and row[0]:
+            _app_settings.update(row[0])
+    except Exception as e:
+        print(f"[settings] {e}")
+    finally:
+        db.close()
 
 # ── Глобальное состояние камер ────────────────────────────────────────────────
 camera_states: dict[int, dict] = {}
@@ -64,6 +102,42 @@ def _fill_zones(frame: np.ndarray, zones: list, color_bgr: tuple,
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
         cv2.polylines(frame, [pts], True, color_bgr, border)
     return frame
+
+
+# ── Геометрические вспомогательные ───────────────────────────────────────────
+
+def _calc_iou(box1, box2) -> float:
+    x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    a1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    a2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _was_moving_before(history: dict, tid: int, min_len: int = 20) -> bool:
+    if tid not in history or len(history[tid]) < min_len:
+        return False
+    track = list(history[tid])
+    old    = track[:10]
+    recent = track[-10:]
+    old_d    = sum(math.hypot(old[i+1][0]-old[i][0],    old[i+1][1]-old[i][1])    for i in range(len(old)-1))
+    recent_d = sum(math.hypot(recent[i+1][0]-recent[i][0], recent[i+1][1]-recent[i][1]) for i in range(len(recent)-1))
+    return old_d > 30 and recent_d < 10
+
+
+def _build_road_mask(frame: np.ndarray, road_zones: list):
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for zone in road_zones:
+        cv2.fillPoly(mask, [np.array(zone, dtype=np.int32)], 255)
+    return mask
+
+
+def _in_mask(mask: np.ndarray, cx: int, cy: int) -> bool:
+    h, w = mask.shape[:2]
+    return bool(mask[min(cy, h-1), min(cx, w-1)] == 255)
 
 
 # ── Детекторы ─────────────────────────────────────────────────────────────────
@@ -307,6 +381,305 @@ def _detect_pedestrian(frame: np.ndarray, results, camera, state: dict) -> dict:
     return {"pedestrians": pedestrians, "road_zones": road_zones, "crosswalk_zones": crosswalk_zones}
 
 
+# ── Детектор ДТП ─────────────────────────────────────────────────────────────
+
+def _detect_accident(frame: np.ndarray, results, camera, state: dict) -> dict:
+    road_zones = getattr(camera, "road_zones", None) or []
+    mask = _build_road_mask(frame, road_zones)
+    use_mask = bool(road_zones)
+
+    track_history : dict  = state.setdefault("_acc_history",  {})
+    col_vehicles  : set   = state.setdefault("_acc_col_ids",  set())
+    confirmed     : int   = state.get("_acc_confirmed", 0)
+    active        : bool  = state.get("_acc_active",    False)
+    frames_after  : int   = state.get("_acc_frames_after", 0)
+    saved_ids     : set   = state.get("_acc_saved_ids", set())
+    display_box   : tuple = state.get("_acc_display_box", None)
+
+    VEHICLE_CLS   = {2, 3, 5, 7}
+    IOU_THRESH    = 0.15
+    REQ_FRAMES    = 3
+
+    accidents = []
+
+    if results is not None and results.boxes is not None and results.boxes.id is not None:
+        boxes     = results.boxes.xyxy.cpu().numpy()
+        track_ids = results.boxes.id.cpu().numpy().astype(int)
+        classes   = results.boxes.cls.cpu().numpy().astype(int)
+
+        vehicles   = []
+        cur_boxes  = {}
+
+        for box, tid, cls in zip(boxes, track_ids, classes):
+            if cls not in VEHICLE_CLS:
+                continue
+            cx, cy = int((box[0]+box[2])/2), int((box[1]+box[3])/2)
+            if use_mask and not _in_mask(mask, cx, cy):
+                continue
+            center = (float(cx), float(cy))
+            if tid not in track_history:
+                track_history[tid] = deque(maxlen=30)
+            track_history[tid].append(center)
+            cur_boxes[int(tid)] = tuple(map(int, box))
+            vehicles.append({"bbox": box, "center": center, "id": int(tid)})
+
+        col_pairs = []
+        for i in range(len(vehicles)):
+            for j in range(i+1, len(vehicles)):
+                if _calc_iou(vehicles[i]["bbox"], vehicles[j]["bbox"]) > IOU_THRESH:
+                    v1s = _was_moving_before(track_history, vehicles[i]["id"])
+                    v2s = _was_moving_before(track_history, vehicles[j]["id"])
+                    if v1s or v2s:
+                        col_pairs.append((vehicles[i], vehicles[j]))
+                        col_vehicles.add(vehicles[i]["id"])
+                        col_vehicles.add(vehicles[j]["id"])
+
+        if col_pairs:
+            confirmed += 1
+            if confirmed >= REQ_FRAMES and not active:
+                active       = True
+                frames_after = 0
+                saved_ids    = col_vehicles.copy()
+                state["_acc_saved_ids"] = saved_ids
+                # Строим объединяющий bbox
+                involved = [cur_boxes[tid] for tid in saved_ids if tid in cur_boxes]
+                if involved:
+                    bx1 = min(b[0] for b in involved); by1 = min(b[1] for b in involved)
+                    bx2 = max(b[2] for b in involved); by2 = max(b[3] for b in involved)
+                    display_box = (bx1, by1, bx2, by2)
+                    state["_acc_display_box"] = display_box
+                print(f"[cam {camera.id}] ДТП обнаружено!")
+        else:
+            if confirmed < REQ_FRAMES:
+                confirmed = 0
+                col_vehicles.clear()
+
+    if active:
+        frames_after += 1
+        if display_box:
+            accidents.append({"box": display_box})
+        if frames_after > _app_settings.get("acc_display_frames", ACC_DISPLAY_FRAMES):
+            active       = False
+            display_box  = None
+            saved_ids    = set()
+            col_vehicles.clear()
+            state["_acc_display_box"] = None
+            state["_acc_saved_ids"]   = set()
+
+    state["_acc_confirmed"]    = confirmed
+    state["_acc_active"]       = active
+    state["_acc_frames_after"] = frames_after
+
+    return {"accidents": accidents, "road_zones": road_zones}
+
+
+# ── Детектор движения по встречке ─────────────────────────────────────────────
+
+def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
+    road_zones  = getattr(camera, "road_zones",  None) or []
+    lane_lines  = getattr(camera, "lane_lines",  None) or []
+
+    if not lane_lines:
+        return {"violations": [], "road_zones": road_zones, "lane_lines": lane_lines}
+
+    mask     = _build_road_mask(frame, road_zones)
+    use_mask = bool(road_zones)
+
+    track_pos  : dict = state.setdefault("_ww_pos",    {})
+    active_viol: dict = state.setdefault("_ww_active", {})  # tid -> expire_frame
+    frame_num  : int  = state.get("_ww_frame_num", 0)
+
+    VEHICLE_CLS  = {2, 3, 5, 7}
+    MIN_HISTORY  = 10
+    MIN_MOVE_PX  = 15
+    DOT_THRESH   = -0.35   # cos угла > 110° → встречное движение
+    VIOL_EXPIRE  = 90      # кадров отображения нарушения
+
+    violations  = []
+    current_ids = set()
+
+    if results is not None and results.boxes is not None and results.boxes.id is not None:
+        boxes     = results.boxes.xyxy.cpu().numpy()
+        track_ids = results.boxes.id.cpu().numpy().astype(int)
+        classes   = results.boxes.cls.cpu().numpy().astype(int)
+
+        # Нормированные направления каждой стрелки (однократно)
+        lane_dirs = []
+        for lane in lane_lines:
+            if len(lane) < 2:
+                continue
+            ldx = lane[1][0] - lane[0][0]
+            ldy = lane[1][1] - lane[0][1]
+            ln  = math.sqrt(ldx*ldx + ldy*ldy)
+            if ln < 1:
+                continue
+            mx  = (lane[0][0] + lane[1][0]) / 2
+            my  = (lane[0][1] + lane[1][1]) / 2
+            lane_dirs.append({"dir": (ldx/ln, ldy/ln), "mx": mx, "my": my})
+
+        for box, tid, cls in zip(boxes, track_ids, classes):
+            if cls not in VEHICLE_CLS:
+                continue
+            tid = int(tid)
+            cx, cy = int((box[0]+box[2])/2), int((box[1]+box[3])/2)
+            if use_mask and not _in_mask(mask, cx, cy):
+                continue
+
+            current_ids.add(tid)
+            if tid not in track_pos:
+                track_pos[tid] = deque(maxlen=25)
+            track_pos[tid].append((float(cx), float(cy)))
+
+            if len(track_pos[tid]) >= MIN_HISTORY:
+                pts = list(track_pos[tid])
+                dx  = pts[-1][0] - pts[0][0]
+                dy  = pts[-1][1] - pts[0][1]
+                mv  = math.sqrt(dx*dx + dy*dy)
+                if mv >= MIN_MOVE_PX:
+                    vx, vy = dx/mv, dy/mv
+                    # Ближайшая стрелка к транспортному средству
+                    best_dot  = 1.0
+                    best_dist = float('inf')
+                    for ld in lane_dirs:
+                        d = math.sqrt((cx - ld["mx"])**2 + (cy - ld["my"])**2)
+                        if d < best_dist:
+                            best_dist = d
+                            best_dot  = vx*ld["dir"][0] + vy*ld["dir"][1]
+                    if best_dot < DOT_THRESH:
+                        active_viol[tid] = frame_num + VIOL_EXPIRE
+
+            if active_viol.get(tid, -1) >= frame_num:
+                violations.append({"box": tuple(map(int, box)), "track_id": tid})
+
+        # Очищаем устаревшие нарушения потерянных треков
+        for tid in list(track_pos.keys()):
+            if tid not in current_ids:
+                track_pos[tid]  # оставляем историю, deque сам ограничивает
+
+    # Показываем активные нарушения (треки, которые вышли из поля зрения, но ещё «горят»)
+    already = {v["track_id"] for v in violations}
+    for tid, exp in list(active_viol.items()):
+        if exp < frame_num:
+            del active_viol[tid]
+        elif tid not in already and tid not in current_ids:
+            pass  # трек потерян — не добавляем призрак
+
+    state["_ww_frame_num"] = frame_num + 1
+    return {"violations": violations, "road_zones": road_zones, "lane_lines": lane_lines}
+
+
+# ── Детектор превышения скорости ──────────────────────────────────────────────
+
+def _detect_speeding(frame: np.ndarray, results, camera, state: dict) -> dict:
+    road_zones = getattr(camera, "road_zones", None) or []
+    mask       = _build_road_mask(frame, road_zones)
+    use_mask   = bool(road_zones)
+
+    fps       : float = state.get("_fps", 25)
+    vehicles  : dict  = state.setdefault("_spd_vehicles",   {})
+    last_boxes: dict  = state.get("_spd_last_boxes", {})
+
+    VEHICLE_CLS   = {2, 3, 5, 7}
+    POS_HISTORY   = 15
+    NUM_MZ        = 5
+    # Весовые коэффициенты для перспективы (верхняя зона → меньший масштаб)
+    SEG_WEIGHTS   = [1.92, 1.68, 1.41, 1.15, 0.93]
+
+    speeders     = []
+    current_ids  = set()
+    cur_boxes    = {}
+
+    if results is not None and results.boxes is not None and results.boxes.id is not None:
+        boxes     = results.boxes.xyxy.cpu().numpy()
+        track_ids = results.boxes.id.cpu().numpy().astype(int)
+        classes   = results.boxes.cls.cpu().numpy().astype(int)
+
+        # Определяем Y-диапазон дорожной зоны для микрозон
+        zone_y1 = zone_y2 = None
+        if road_zones:
+            all_ys  = [p[1] for zone in road_zones for p in zone]
+            zone_y1 = min(all_ys); zone_y2 = max(all_ys)
+
+        for box, tid, cls in zip(boxes, track_ids, classes):
+            if cls not in VEHICLE_CLS:
+                continue
+            tid = int(tid)
+            x1, y1, x2, y2 = map(int, box)
+            cx, cy = (x1+x2)//2, (y1+y2)//2
+            if use_mask and not _in_mask(mask, cx, cy):
+                continue
+
+            current_ids.add(tid)
+            cur_boxes[tid] = (x1, y1, x2, y2)
+            center = (cx, cy)
+
+            if tid not in vehicles:
+                vehicles[tid] = {
+                    "positions": [center], "last_seen": 0,
+                    "current_speed": 0.0, "speed_history": [],
+                    "last_box": (x1, y1, x2, y2),
+                }
+                continue
+
+            veh = vehicles[tid]
+            lc  = veh["positions"][-1] if veh["positions"] else None
+            if lc and abs(center[0]-lc[0]) + abs(center[1]-lc[1]) > 150:
+                continue  # прыжок детекции — пропускаем
+
+            veh["positions"].append(center)
+            veh["last_seen"] = 0
+            veh["last_box"]  = (x1, y1, x2, y2)
+            if len(veh["positions"]) > POS_HISTORY:
+                veh["positions"].pop(0)
+
+            if len(veh["positions"]) >= 4:
+                # Перспективный вес по Y-позиции
+                if zone_y1 is not None:
+                    zone_h = max(zone_y2 - zone_y1, 1)
+                    mz_h   = zone_h / NUM_MZ
+                    zi     = int((cy - zone_y1) / mz_h)
+                    weight = SEG_WEIGHTS[max(0, min(NUM_MZ-1, zi))]
+                else:
+                    weight = 1.0
+
+                pos  = veh["positions"]
+                spds = []
+                for i in range(1, len(pos)):
+                    dx = pos[i][0] - pos[i-1][0]
+                    dy = pos[i][1] - pos[i-1][1]
+                    d  = math.sqrt(dx*dx + dy*dy)
+                    s  = (d * fps / _app_settings.get("base_px_per_meter", BASE_PX_PER_METER)) * 3.6 * weight
+                    if s > 0.5:
+                        spds.append(s)
+
+                if len(spds) >= 3:
+                    veh["speed_history"].append(float(np.median(spds)))
+                    if len(veh["speed_history"]) > 5:
+                        veh["speed_history"].pop(0)
+                    veh["current_speed"] = float(np.median(veh["speed_history"]))
+
+        last_boxes = cur_boxes
+        for tid in list(vehicles.keys()):
+            if tid not in current_ids:
+                vehicles[tid]["last_seen"] += 1
+                if vehicles[tid]["last_seen"] > 20:
+                    del vehicles[tid]
+
+        state["_spd_last_boxes"] = last_boxes
+
+        cam_speed_limit = getattr(camera, "speed_limit", None) or _app_settings.get("default_speed_limit_kmh", SPEED_LIMIT_KMH)
+        _base_px = _app_settings.get("base_px_per_meter", BASE_PX_PER_METER)
+        for tid, veh in vehicles.items():
+            if veh["current_speed"] > cam_speed_limit and tid in last_boxes:
+                speeders.append({
+                    "box":      veh["last_box"],
+                    "track_id": tid,
+                    "speed":    veh["current_speed"],
+                })
+
+    return {"speeders": speeders, "road_zones": road_zones}
+
+
 # ── Отрисовка инцидентов ──────────────────────────────────────────────────────
 
 def draw_incidents(frame: np.ndarray, incidents: dict, filters: list[str]) -> np.ndarray:
@@ -319,38 +692,61 @@ def draw_incidents(frame: np.ndarray, incidents: dict, filters: list[str]) -> np
             continue
 
         if key == "traffic_jam":
-            COLOR = (26, 165, 246)
-            _fill_zones(result, data.get("road_zones", []), COLOR, alpha=0.08, border=1)
+            COLOR = INC_COLORS["traffic_jam"]
             for jam in data.get("jams", []):
                 x1, y1, x2, y2 = jam["box"]
                 overlay = result.copy()
                 cv2.rectangle(overlay, (x1, y1), (x2, y2), COLOR, -1)
                 cv2.addWeighted(overlay, 0.3, result, 0.7, 0, result)
                 cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)
-                label  = f"Затор  {jam['avg_speed']:.0f} км/ч  ({jam['vehicle_count']} авт.)"
-                result = _label_box(result, label, x1, y1, COLOR)
+                result = _label_box(result, f"Затор  {jam['avg_speed']:.0f} км/ч  ({jam['vehicle_count']} авт.)", x1, y1, COLOR)
 
         elif key == "illegal_stop":
-            ROAD_COLOR = (200, 200, 200)
-            STOP_COLOR = (0, 200, 0)
-            VIOL_COLOR = (0, 0, 255)
-            _fill_zones(result, data.get("road_zones", []), ROAD_COLOR, alpha=0.10, border=1)
-            _fill_zones(result, data.get("stop_zones", []), STOP_COLOR, alpha=0.15, border=2)
+            COLOR = INC_COLORS["illegal_stop"]
             for v in data.get("violations", []):
                 x1, y1, x2, y2 = v["box"]
-                cv2.rectangle(result, (x1, y1), (x2, y2), VIOL_COLOR, 2)
-                result = _label_box(result, "Стоянка в неположенном месте", x1, y1, VIOL_COLOR)
+                cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)
+                result = _label_box(result, "Стоянка в неположенном месте", x1, y1, COLOR)
 
         elif key == "pedestrian":
-            ROAD_COLOR  = (200, 200, 200)
-            CROSS_COLOR = (0, 200, 100)
-            PED_COLOR   = (50, 130, 246)
-            _fill_zones(result, data.get("road_zones",      []), ROAD_COLOR,  alpha=0.08, border=1)
-            _fill_zones(result, data.get("crosswalk_zones", []), CROSS_COLOR, alpha=0.15, border=2)
+            COLOR = INC_COLORS["pedestrian"]
             for p in data.get("pedestrians", []):
                 x1, y1, x2, y2 = p["box"]
-                cv2.rectangle(result, (x1, y1), (x2, y2), PED_COLOR, 2)
-                result = _label_box(result, "Пешеход на проезжей части вне перехода", x1, y1, PED_COLOR)
+                cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)
+                result = _label_box(result, "Пешеход на проезжей части вне перехода", x1, y1, COLOR)
+
+        elif key == "accident":
+            COLOR = INC_COLORS["accident"]
+            for acc in data.get("accidents", []):
+                x1, y1, x2, y2 = acc["box"]
+                overlay = result.copy()
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), COLOR, -1)
+                cv2.addWeighted(overlay, 0.25, result, 0.75, 0, result)
+                cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 3)
+                result = _label_box(result, "ДТП", x1, y1, COLOR)
+
+        elif key == "wrong_way":
+            COLOR      = INC_COLORS["wrong_way"]
+            LANE_COLOR = (255, 180, 0)
+            for lane in data.get("lane_lines", []):
+                if len(lane) >= 2:
+                    cv2.arrowedLine(
+                        result,
+                        (int(lane[0][0]), int(lane[0][1])),
+                        (int(lane[1][0]), int(lane[1][1])),
+                        LANE_COLOR, 2, tipLength=0.3,
+                    )
+            for v in data.get("violations", []):
+                x1, y1, x2, y2 = v["box"]
+                cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)
+                result = _label_box(result, "Движение по встречке", x1, y1, COLOR)
+
+        elif key == "speeding":
+            COLOR = INC_COLORS["speeding"]
+            for s in data.get("speeders", []):
+                x1, y1, x2, y2 = s["box"]
+                cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)
+                result = _label_box(result, f"Превышение скорости  {s['speed']:.0f} км/ч", x1, y1, COLOR)
 
     return result
 
@@ -359,24 +755,26 @@ def draw_incidents(frame: np.ndarray, incidents: dict, filters: list[str]) -> np
 
 def _save_incident(camera, incident_type: str, frame: np.ndarray,
                    boxes: list, label: str, box_color: tuple,
-                   last_saved: dict):
+                   last_saved: dict, labels: list | None = None):
     key = (camera.id, incident_type)
     now = time.time()
 
-    if now - last_saved.get(key, 0) < INCIDENT_SAVE_COOLDOWN:
+    cooldown = _app_settings.get("incident_save_cooldown", INCIDENT_SAVE_COOLDOWN)
+    if now - last_saved.get(key, 0) < cooldown:
         return
 
     last_saved[key] = now
 
     filename = None
-    if SAVE_INCIDENT_SCREENSHOTS:
+    if _app_settings.get("save_incident_screenshots", SAVE_INCIDENT_SCREENSHOTS):
         screenshot = frame.copy()
-        for (x1, y1, x2, y2) in boxes:
+        for i, (x1, y1, x2, y2) in enumerate(boxes):
+            lbl = labels[i] if labels and i < len(labels) else label
             cv2.rectangle(screenshot, (x1, y1), (x2, y2), box_color, 2)
-            bbox_f  = _FONT.getbbox(label)
+            bbox_f  = _FONT.getbbox(lbl)
             tw, th  = bbox_f[2] - bbox_f[0], bbox_f[3] - bbox_f[1]
             cv2.rectangle(screenshot, (x1, y1 - th - 8), (x1 + tw + 4, y1), box_color, -1)
-            screenshot = _put_text(screenshot, label, (x1 + 2, y1 - th - 6), (0, 0, 0))
+            screenshot = _put_text(screenshot, lbl, (x1 + 2, y1 - th - 6), (0, 0, 0))
 
         ts       = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{camera.id}_{incident_type}_{ts}.jpg"
@@ -420,6 +818,10 @@ def _reset_detector_state(worker_state: dict):
         "_is_last_pos", "_is_stop_start", "_is_statuses", "_is_viol_fixed", "_is_frame_num",
         "_ped_violated",
         "_tj_vehicles", "_tj_last_boxes", "_tj_frame_count",
+        "_acc_history", "_acc_col_ids", "_acc_confirmed", "_acc_active",
+        "_acc_frames_after", "_acc_saved_ids", "_acc_display_box",
+        "_ww_pos", "_ww_active", "_ww_frame_num",
+        "_spd_vehicles", "_spd_last_boxes",
     ]
     for k in keys_to_clear:
         worker_state.pop(k, None)
@@ -446,7 +848,10 @@ async def camera_worker(camera):
 
     camera_states[camera.id] = {
         "frame":     None,
-        "incidents": {"traffic_jam": None, "illegal_stop": None, "pedestrian": None},
+        "incidents": {
+            "traffic_jam": None, "illegal_stop": None, "pedestrian": None,
+            "accident": None, "wrong_way": None, "speeding": None,
+        },
     }
 
     CAR_CLASSES = [2, 3, 5, 7]
@@ -467,12 +872,15 @@ async def camera_worker(camera):
     while True:
         try:
             now = time.time()
-            if now - last_zones_refresh >= CAMERA_ZONES_REFRESH_INTERVAL:
+            zones_interval = _app_settings.get("camera_zones_refresh_interval", CAMERA_ZONES_REFRESH_INTERVAL)
+            if now - last_zones_refresh >= zones_interval:
+                _load_app_settings()
                 try:
                     db    = SessionLocal()
                     fresh = db.query(Camera).filter(Camera.id == camera.id).first()
                     if fresh:
                         _current_incidents = _get_camera_incidents(camera.id)
+                        camera.speed_limit = fresh.speed_limit or SPEED_LIMIT_KMH
                         new_zones = {
                             "road_zones":      list(fresh.road_zones      or []),
                             "stop_zones":      list(fresh.stop_zones      or []),
@@ -483,6 +891,7 @@ async def camera_worker(camera):
                             camera.stop_zones      = fresh.stop_zones      or []
                             camera.crosswalk_zones = fresh.crosswalk_zones or []
                             camera.lane_lines      = fresh.lane_lines      or []
+                            camera.speed_limit     = fresh.speed_limit     or SPEED_LIMIT_KMH
                             _reset_detector_state(worker_state)
                             _prev_zones = new_zones
                 finally:
@@ -522,12 +931,16 @@ async def camera_worker(camera):
 
             last_saved = worker_state["_last_saved"]
 
-            _inc    = _current_incidents
-            run_tj  = run_is = run_ped = True
+            _inc     = _current_incidents
+            run_tj   = run_is = run_ped = True
+            run_acc  = run_ww = run_spd = True
             if _inc is not None:
                 run_tj  = "traffic_jam"  in _inc
                 run_is  = "illegal_stop" in _inc
                 run_ped = "pedestrian"   in _inc
+                run_acc = "accident"     in _inc
+                run_ww  = "wrong_way"    in _inc
+                run_spd = "speeding"     in _inc
 
             tj_data = None
             if run_tj:
@@ -536,7 +949,7 @@ async def camera_worker(camera):
                     if tj_data and tj_data.get("jams"):
                         _save_incident(camera, "traffic_jam", frame,
                                        [j["box"] for j in tj_data["jams"]],
-                                       "Затор", (26, 165, 246), last_saved)
+                                       "Затор", INC_COLORS["traffic_jam"], last_saved)
                 except Exception as e:
                     print(f"[camera_worker] Камера {camera.id}: ошибка _detect_traffic_jam — {e}")
                     tj_data = None
@@ -548,7 +961,7 @@ async def camera_worker(camera):
                     if is_data and is_data.get("violations"):
                         _save_incident(camera, "illegal_stop", frame,
                                        [v["box"] for v in is_data["violations"]],
-                                       "Стоянка в неположенном месте", (0, 0, 255), last_saved)
+                                       "Стоянка в неположенном месте", INC_COLORS["illegal_stop"], last_saved)
                 except Exception as e:
                     print(f"[camera_worker] Камера {camera.id}: ошибка _detect_illegal_stop — {e}")
                     is_data = None
@@ -561,10 +974,48 @@ async def camera_worker(camera):
                         _save_incident(camera, "pedestrian", frame,
                                        [p["box"] for p in ped_data["pedestrians"]],
                                        "Пешеход на проезжей части вне перехода",
-                                       (50, 130, 246), last_saved)
+                                       INC_COLORS["pedestrian"], last_saved)
                 except Exception as e:
                     print(f"[camera_worker] Камера {camera.id}: ошибка _detect_pedestrian — {e}")
                     ped_data = None
+
+            acc_data = None
+            if run_acc:
+                try:
+                    acc_data = _detect_accident(frame, results, camera, worker_state)
+                    if acc_data and acc_data.get("accidents"):
+                        _save_incident(camera, "accident", frame,
+                                       [a["box"] for a in acc_data["accidents"]],
+                                       "ДТП", INC_COLORS["accident"], last_saved)
+                except Exception as e:
+                    print(f"[camera_worker] Камера {camera.id}: ошибка _detect_accident — {e}")
+                    acc_data = None
+
+            ww_data = None
+            if run_ww:
+                try:
+                    ww_data = _detect_wrong_way(frame, results, camera, worker_state)
+                    if ww_data and ww_data.get("violations"):
+                        _save_incident(camera, "wrong_way", frame,
+                                       [v["box"] for v in ww_data["violations"]],
+                                       "Движение по встречке", INC_COLORS["wrong_way"], last_saved)
+                except Exception as e:
+                    print(f"[camera_worker] Камера {camera.id}: ошибка _detect_wrong_way — {e}")
+                    ww_data = None
+
+            spd_data = None
+            if run_spd:
+                try:
+                    spd_data = _detect_speeding(frame, results, camera, worker_state)
+                    if spd_data and spd_data.get("speeders"):
+                        _save_incident(camera, "speeding", frame,
+                                       [s["box"] for s in spd_data["speeders"]],
+                                       "Превышение скорости", INC_COLORS["speeding"], last_saved,
+                                       labels=[f"Превышение скорости  {s['speed']:.0f} км/ч"
+                                               for s in spd_data["speeders"]])
+                except Exception as e:
+                    print(f"[camera_worker] Камера {camera.id}: ошибка _detect_speeding — {e}")
+                    spd_data = None
 
             camera_states[camera.id] = {
                 "frame": frame,
@@ -572,6 +1023,9 @@ async def camera_worker(camera):
                     "traffic_jam":  tj_data,
                     "illegal_stop": is_data,
                     "pedestrian":   ped_data,
+                    "accident":     acc_data,
+                    "wrong_way":    ww_data,
+                    "speeding":     spd_data,
                 },
             }
 
@@ -588,7 +1042,7 @@ def _start_camera_worker(cam):
 
 async def _camera_watchdog():
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(_app_settings.get("watchdog_interval", 30))
         db = SessionLocal()
         try:
             cameras = db.query(Camera).all()
@@ -715,6 +1169,7 @@ async def get_camera_zones(
         "crosswalk_zones": camera.crosswalk_zones or [],
         "lane_lines":      camera.lane_lines or [],
         "incidents":       _get_camera_incidents(camera.id),
+        "speed_limit":     camera.speed_limit if camera.speed_limit is not None else 60,
     }
 
 
@@ -735,8 +1190,10 @@ async def save_camera_zones(
     for zone_key in ["road_zones", "stop_zones", "crosswalk_zones", "lane_lines"]:
         polygons  = zones.get(zone_key, [])
         validated = []
+        # lane_lines хранит 2-точечные стрелки направления, остальные — полигоны (≥3)
+        min_pts = 2 if zone_key == "lane_lines" else 3
         for poly in polygons:
-            if not isinstance(poly, list) or len(poly) < 3:
+            if not isinstance(poly, list) or len(poly) < min_pts:
                 continue
             clean_poly = []
             for point in poly:
@@ -745,7 +1202,7 @@ async def save_camera_zones(
                         clean_poly.append([int(point[0]), int(point[1])])
                     except (ValueError, TypeError):
                         continue
-            if len(clean_poly) >= 3:
+            if len(clean_poly) >= min_pts:
                 validated.append(clean_poly)
 
         setattr(camera, zone_key, validated)
@@ -754,3 +1211,30 @@ async def save_camera_zones(
     db.commit()
     db.refresh(camera)
     return {"ok": True, "message": f"Зоны камеры '{camera_name}' сохранены"}
+
+
+@router.patch("/cameras/{name}/speed-limit")
+async def set_camera_speed_limit(
+    name: str,
+    data: dict = Body(...),
+    current_user: str | bool = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from fastapi import HTTPException
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    admin = db.query(SuperAdmin).filter(SuperAdmin.email == current_user).first()
+    if not admin:
+        raise HTTPException(status_code=403, detail="Нет прав")
+    camera = db.query(Camera).filter(Camera.name == name).first()
+    if not camera:
+        raise HTTPException(status_code=404, detail="Камера не найдена")
+    try:
+        limit = float(data.get("speed_limit", 60))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректное значение скорости")
+    if limit <= 0 or limit > 300:
+        raise HTTPException(status_code=400, detail="Скорость должна быть от 1 до 300 км/ч")
+    camera.speed_limit = limit
+    db.commit()
+    return {"ok": True, "speed_limit": limit}

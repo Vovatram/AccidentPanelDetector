@@ -1,6 +1,6 @@
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import sessionmaker, Session
@@ -21,7 +21,7 @@ CAMERA_ZONES_REFRESH_INTERVAL = 10
 INCIDENTS_PHOTOS_DIR          = "incidents"
 SAVE_INCIDENT_SCREENSHOTS     = True
 
-DATABASE_URL = "postgresql://postgres:Metro1935)@localhost:5432/apd"
+DATABASE_URL = "postgresql://postgres:1234@localhost:5432/apd"
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -75,6 +75,7 @@ class Camera(Base):
     stop_zones      = Column(JSONB, nullable=False, server_default='[]')
     crosswalk_zones = Column(JSONB, nullable=False, server_default='[]')
     lane_lines      = Column(JSONB, nullable=False, server_default='[]')
+    speed_limit     = Column(Float, nullable=False, server_default='60')
 
 
 class Incident(Base):
@@ -92,6 +93,12 @@ class SuperAdmin(Base):
     __tablename__ = "superadmins"
     id    = Column(Integer, primary_key=True, autoincrement=True)
     email = Column(String(255), nullable=False, unique=True)
+
+
+class AppSettings(Base):
+    __tablename__ = "app_settings"
+    id       = Column(Integer, primary_key=True, autoincrement=True)
+    settings = Column(JSONB, nullable=False, server_default='{}')
 
 
 class EmailSchema(BaseModel):
@@ -171,11 +178,30 @@ def run_migrations():
     db = SessionLocal()
     try:
         from sqlalchemy import text as _text
+        Base.metadata.create_all(engine)
         for sql in [
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified VARCHAR(64)",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_code VARCHAR(64)",
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS speed_limit FLOAT NOT NULL DEFAULT 60",
+            "SELECT setval('cameras_id_seq', GREATEST((SELECT COALESCE(MAX(id),0) FROM cameras), 1))",
+            "SELECT setval('users_id_seq',   GREATEST((SELECT COALESCE(MAX(id),0) FROM users),   1))",
+            "SELECT setval('data_id_seq',    GREATEST((SELECT COALESCE(MAX(id),0) FROM data),    1))",
         ]:
             db.execute(_text(sql))
+        # Seed default app_settings row if missing
+        existing = db.execute(_text("SELECT COUNT(*) FROM app_settings")).scalar()
+        if existing == 0:
+            import json as _j
+            defaults = _j.dumps({
+                "incident_save_cooldown": 300,
+                "camera_zones_refresh_interval": 10,
+                "save_incident_screenshots": True,
+                "default_speed_limit_kmh": 60.0,
+                "base_px_per_meter": 7.5,
+                "acc_display_frames": 270,
+                "watchdog_interval": 30,
+            })
+            db.execute(_text(f"INSERT INTO app_settings (settings) VALUES ('{defaults}'::jsonb)"))
         db.commit()
     except Exception as e:
         print(f"[migrations] {e}")

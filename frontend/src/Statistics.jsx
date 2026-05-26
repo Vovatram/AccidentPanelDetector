@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import useTheme from './useTheme';
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -44,10 +45,19 @@ function fmtBucketDate(tsFrom) {
 }
 
 function Tooltip({bucket,cameras,types,x,y,visible}) {
+  const ref  = useRef(null);
+  const [left, setLeft] = useState(x + 14);
+
+  useLayoutEffect(() => {
+    if (!ref.current || !visible) return;
+    const w = ref.current.offsetWidth;
+    setLeft(x + 14 + w > window.innerWidth ? x - 14 - w : x + 14);
+  }, [x, y, visible]);
+
   if (!visible||!bucket) return null;
   const total = cameras.reduce((s,c)=>s+types.reduce((ss,t)=>ss+(bucket.data[c]?.[t]||0),0),0);
   return (
-    <div style={{position:"fixed",left:x+14,top:y-8,zIndex:200,pointerEvents:"none"}}
+    <div ref={ref} style={{position:"fixed",left,top:y-8,zIndex:200,pointerEvents:"none"}}
       className="bg-gray-900 border border-gray-600 rounded-lg shadow-2xl p-3 min-w-44 text-sm">
       <div className="font-bold text-white mb-1.5 border-b border-gray-700 pb-1 flex justify-between">
         <span>{bucket.label}</span>
@@ -98,6 +108,8 @@ function StackedBar({bucket,cameras,types,maxVal,isSelected,onClick}) {
 export default function Statistics() {
   const navigate = useNavigate();
   const {camera:urlCamera} = useParams();
+  const [theme, setTheme] = useTheme();
+  const D = theme === 'dark';
 
   const wsRef          = useRef(null);
   const reconnTimerRef = useRef(null);
@@ -225,28 +237,28 @@ export default function Statistics() {
     : `Камеры: ${selectedCameras.length}/${allCams.length} ▾`;
 
   return (
-    <div className="min-h-screen bg-gray-900 text-white flex flex-col select-none">
+    <div className={`min-h-screen flex flex-col select-none ${D?'bg-gray-900 text-white':'bg-gray-100 text-gray-900'}`}>
       {/* Шапка */}
-      <div className="bg-gray-800 border-b border-gray-700 px-4 py-2 flex items-center gap-3 flex-wrap">
+      <div className={`border-b px-4 py-2 flex items-center gap-3 flex-wrap ${D?'bg-gray-800 border-gray-700':'bg-white border-gray-200'}`}>
         <button onClick={()=>navigate(-1)}
-          className="w-9 h-9 rounded-full bg-gray-700 hover:bg-gray-600 flex items-center justify-center text-lg shrink-0">←</button>
+          className={`w-9 h-9 rounded-full flex items-center justify-center text-lg shrink-0 ${D?'bg-gray-700 hover:bg-gray-600':'bg-gray-200 hover:bg-gray-300'}`}>←</button>
         <h1 className="text-sm font-bold shrink-0">📊 Статистика</h1>
 
         {/* Фильтр камер — чекбоксы */}
         <div className="relative">
           <button onClick={()=>setShowCamFilter(p=>!p)}
-            className={`px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 border text-sm ${showCamFilter?"border-indigo-500":"border-gray-600"}`}>
+            className={`px-3 py-1.5 rounded border text-sm ${showCamFilter?"border-indigo-500":"border-gray-500"} ${D?'bg-gray-700 hover:bg-gray-600':'bg-gray-200 hover:bg-gray-300'}`}>
             {camBtnLabel}
           </button>
           {showCamFilter&&(
-            <div className="absolute top-full mt-1 left-0 z-50 bg-gray-800 border border-gray-600 rounded-lg shadow-2xl p-3 min-w-56"
+            <div className={`absolute top-full mt-1 left-0 z-50 border rounded-lg shadow-2xl p-3 min-w-56 ${D?'bg-gray-800 border-gray-600':'bg-white border-gray-200'}`}
                  onMouseLeave={()=>setShowCamFilter(false)}>
               <div className="flex gap-3 mb-2">
                 <button onClick={()=>setSelectedCameras([])} className="text-xs text-indigo-400">Все</button>
               </div>
               <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5">
                 {allCams.map(cam=>(
-                  <label key={cam} className="flex items-center gap-2 text-sm hover:bg-gray-700 px-2 py-1 rounded cursor-pointer">
+                  <label key={cam} className={`flex items-center gap-2 text-sm px-2 py-1 rounded cursor-pointer ${D?'hover:bg-gray-700':'hover:bg-gray-100'}`}>
                     <input type="checkbox" checked={isCamChecked(cam)}
                       onChange={()=>toggleCam(cam)}
                       className="accent-indigo-500"/>
@@ -261,18 +273,18 @@ export default function Statistics() {
         {/* Фильтр типов */}
         <div className="relative">
           <button onClick={()=>setShowTypeFilter(p=>!p)}
-            className={`px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 border text-sm ${showTypeFilter?"border-indigo-500":"border-gray-600"}`}>
+            className={`px-3 py-1.5 rounded border text-sm ${showTypeFilter?"border-indigo-500":"border-gray-500"} ${D?'bg-gray-700 hover:bg-gray-600':'bg-gray-200 hover:bg-gray-300'}`}>
             Типы ({selectedTypes.length}/{INCIDENT_TYPES.length}) ▾
           </button>
           {showTypeFilter&&(
-            <div className="absolute top-full mt-1 left-0 z-50 bg-gray-800 border border-gray-600 rounded-lg shadow-2xl p-3 w-72"
+            <div className={`absolute top-full mt-1 left-0 z-50 border rounded-lg shadow-2xl p-3 w-72 ${D?'bg-gray-800 border-gray-600':'bg-white border-gray-200'}`}
                  onMouseLeave={()=>setShowTypeFilter(false)}>
               <div className="flex gap-3 mb-2">
                 <button onClick={()=>setSelectedTypes([...INCIDENT_TYPES])} className="text-xs text-indigo-400">Все</button>
-                <button onClick={()=>setSelectedTypes([])} className="text-xs text-gray-400">Снять</button>
+                <button onClick={()=>setSelectedTypes([])} className={`text-xs ${D?'text-gray-400':'text-gray-500'}`}>Снять</button>
               </div>
               {INCIDENT_TYPES.map(t=>(
-                <label key={t} className="flex items-center gap-2 text-sm hover:bg-gray-700 px-2 py-1 rounded cursor-pointer">
+                <label key={t} className={`flex items-center gap-2 text-sm px-2 py-1 rounded cursor-pointer ${D?'hover:bg-gray-700':'hover:bg-gray-100'}`}>
                   <input type="checkbox" checked={selectedTypes.includes(t)}
                     onChange={()=>setSelectedTypes(prev=>prev.includes(t)?prev.filter(x=>x!==t):[...prev,t])}
                     className="accent-indigo-500"/>
@@ -285,27 +297,31 @@ export default function Statistics() {
         </div>
 
         <select value={step} onChange={e=>handleStepChange(Number(e.target.value))}
-          className="px-2 py-1.5 rounded bg-gray-700 border border-gray-600 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+          className={`px-2 py-1.5 rounded border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 ${D?'bg-gray-700 border-gray-600 text-white':'bg-white border-gray-300 text-gray-900'}`}>
           {STEP_OPTIONS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
 
         <div className="flex items-center gap-2">
           <span className="text-xs opacity-50 shrink-0">С:</span>
           <input type="datetime-local" value={timeFrom} onChange={e=>setTimeFrom(e.target.value)}
-            className="px-2 py-1 rounded bg-gray-700 border border-gray-600 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+            className={`px-2 py-1 rounded border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 ${D?'bg-gray-700 border-gray-600 text-white':'bg-white border-gray-300 text-gray-900'}`}/>
         </div>
 
-        <div className="flex items-center gap-1.5 ml-auto">
+        <div className="flex items-center gap-2 ml-auto">
           {loading&&<span className="text-xs opacity-50 animate-pulse">загрузка...</span>}
           <div className={`w-2 h-2 rounded-full ${wsStatus==="connected"?"bg-green-500":wsStatus==="connecting"?"bg-yellow-500 animate-pulse":"bg-red-500"}`}/>
           <span className="text-xs opacity-50">{wsStatus==="connected"?"live":wsStatus==="connecting"?"подкл.":"офлайн"}</span>
+          <button onClick={()=>setTheme(D?'light':'dark')}
+            className={`w-8 h-8 rounded-full flex items-center justify-center text-base ${D?'bg-gray-700 hover:bg-gray-600':'bg-gray-200 hover:bg-gray-300'}`}>
+            {D?'☀️':'🌙'}
+          </button>
         </div>
       </div>
 
       {/* Навигация по времени */}
-      <div className="flex items-center gap-2 px-4 py-2 bg-gray-800 border-b border-gray-700 text-sm">
-        <button onClick={()=>shiftTime(-1)} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600">← Назад</button>
-        <button onClick={()=>shiftTime(1)} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600">Вперёд →</button>
+      <div className={`flex items-center gap-2 px-4 py-2 border-b text-sm ${D?'bg-gray-800 border-gray-700':'bg-white border-gray-200'}`}>
+        <button onClick={()=>shiftTime(-1)} className={`px-3 py-1 rounded ${D?'bg-gray-700 hover:bg-gray-600':'bg-gray-200 hover:bg-gray-300'}`}>← Назад</button>
+        <button onClick={()=>shiftTime(1)} className={`px-3 py-1 rounded ${D?'bg-gray-700 hover:bg-gray-600':'bg-gray-200 hover:bg-gray-300'}`}>Вперёд →</button>
       </div>
 
       {/* График */}
@@ -328,7 +344,7 @@ export default function Statistics() {
               {/* Бары */}
               <div className="flex-1 relative min-w-0">
                 <div className="absolute inset-0 flex flex-col justify-between pointer-events-none z-0">
-                  {[0,1,2,3,4].map(i=><div key={i} className="border-t border-gray-700 w-full"/>)}
+                  {[0,1,2,3,4].map(i=><div key={i} className={`border-t w-full ${D?'border-gray-700':'border-gray-200'}`}/>)}
                 </div>
                 <div className="flex items-end h-full relative z-10"
                      onMouseLeave={()=>setTooltip(t=>({...t,visible:false}))}>
@@ -364,10 +380,10 @@ export default function Statistics() {
 
       {/* Детали бакета */}
       {selectedBucket!==null&&pageBuckets[selectedBucket]&&(
-        <div className="mx-4 mb-2 p-3 bg-gray-800 rounded-lg border border-gray-700">
+        <div className={`mx-4 mb-2 p-3 rounded-lg border ${D?'bg-gray-800 border-gray-700':'bg-white border-gray-200 shadow-sm'}`}>
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold text-sm">⏱ {pageBuckets[selectedBucket].label}</span>
-            <button onClick={()=>setSelectedBucket(null)} className="text-gray-400 hover:text-white">✕</button>
+            <button onClick={()=>setSelectedBucket(null)} className={D?'text-gray-400 hover:text-white':'text-gray-500 hover:text-gray-900'}>✕</button>
           </div>
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
             {cameras.map(cam=>{
@@ -375,8 +391,8 @@ export default function Statistics() {
               const ct=types.reduce((s,t)=>s+(d[t]||0),0);
               if (!ct) return null;
               return (
-                <div key={cam} className="bg-gray-700 rounded p-2">
-                  <div className="text-xs text-gray-400 truncate mb-1">{cam}</div>
+                <div key={cam} className={`rounded p-2 ${D?'bg-gray-700':'bg-gray-100'}`}>
+                  <div className={`text-xs truncate mb-1 ${D?'text-gray-400':'text-gray-500'}`}>{cam}</div>
                   {types.map(t=>{const v=d[t]||0;if(!v)return null;return(
                     <div key={t} className="flex items-center gap-1.5 text-xs">
                       <span style={{background:TYPE_COLORS[t]||"#888"}} className="w-2 h-2 rounded-sm shrink-0"/>

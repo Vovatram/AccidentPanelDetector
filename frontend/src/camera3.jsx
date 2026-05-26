@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from 'react-router-dom';
 import axios from 'axios';
+import useTheme from './useTheme';
 
 const INCIDENT_TYPES = [
   'Стоянка в неположенном месте','ДТП','Превышение скорости',
@@ -10,6 +11,9 @@ const BACKEND_TO_DISPLAY = {
   traffic_jam:  'Затор',
   illegal_stop: 'Стоянка в неположенном месте',
   pedestrian:   'Пешеход в неположенном месте',
+  accident:     'ДТП',
+  wrong_way:    'Движение по встречке',
+  speeding:     'Превышение скорости',
 };
 const DISPLAY_TO_BACKEND = Object.fromEntries(
   Object.entries(BACKEND_TO_DISPLAY).map(([k,v])=>[v,k])
@@ -208,7 +212,7 @@ function Camera() {
   const [wsNotifStatus, setWsNotifStatus] = useState('disconnected');
 
   const [showAuthModal, setShowAuthModal] = useState(false);
-  const [theme, setTheme] = useState('dark');
+  const [theme, setTheme] = useTheme();
   const [toastMsg, setToastMsg]   = useState('');
   const [showToast, setShowToast] = useState(false);
 
@@ -217,6 +221,9 @@ function Camera() {
   const [detectionSelected,  setDetectionSelected]  = useState([...DETECTABLE]);
   const [isSuperAdmin,       setIsSuperAdmin]        = useState(false);
   const [hasZones,           setHasZones]            = useState(false);
+  const [speedLimit,         setSpeedLimit]          = useState(60);
+  const [editingSpeedLimit,  setEditingSpeedLimit]   = useState(false);
+  const [speedLimitInput,    setSpeedLimitInput]     = useState('60');
 
   // Ссылки на актуальные значения для замыканий WS
   const siteSubsRef      = useRef(siteSubs);
@@ -288,12 +295,12 @@ function Camera() {
       .then(d=>{
         const has = (d.road_zones?.length>0)||(d.stop_zones?.length>0)||(d.crosswalk_zones?.length>0);
         setHasZones(has);
-        if (!isSuperAdmin) return;
-        // Инициализируем processCamera и detectionSelected из столбца incidents
+        if (d.speed_limit != null) { setSpeedLimit(d.speed_limit); setSpeedLimitInput(String(d.speed_limit)); }
+        // Инициализируем processCamera из столбца incidents для всех пользователей
         const inc = d.incidents;
         if (inc === false) {
           setProcessCamera(false);
-        } else if (Array.isArray(inc) && inc.length > 0) {
+        } else if (isSuperAdmin && Array.isArray(inc) && inc.length > 0) {
           setProcessCamera(true);
           const displayNames = inc.map(k => BACKEND_TO_DISPLAY[k]).filter(Boolean);
           if (displayNames.length) setDetectionSelected(displayNames);
@@ -714,6 +721,27 @@ function Camera() {
           </div>
           <div className="p-3 space-y-3">
 
+            {/* Удаление камеры — только суперадмин */}
+            {isSuperAdmin&&(
+              <button
+                onClick={async () => {
+                  if (!window.confirm(`Удалить камеру "${name}"?\n\nЭто действие нельзя отменить.`)) return;
+                  const token = localStorage.getItem('access_token');
+                  try {
+                    await fetch(`${import.meta.env.VITE_API_URL}/cameras/${encodeURIComponent(name)}`, {
+                      method: 'DELETE',
+                      headers: { Authorization: `Bearer ${token}` },
+                    });
+                    navigate('/');
+                  } catch {
+                    toast('Ошибка удаления камеры');
+                  }
+                }}
+                className="w-full py-2 rounded text-sm font-semibold bg-red-700 hover:bg-red-600 text-white transition-colors">
+                🗑️ Удалить камеру
+              </button>
+            )}
+
             {/* Мастер-кнопка — только суперадмин с настроенными зонами */}
             {isSuperAdmin&&(
               <button onClick={()=>setProcessCamera(p=>!p)}
@@ -745,12 +773,60 @@ function Camera() {
                 </div>
                 <div className="space-y-1 p-2 rounded border border-gray-600">
                   {DETECTABLE.map(type=>(
-                    <label key={type} className="flex items-center gap-2 cursor-pointer text-sm hover:bg-gray-700 px-1 py-0.5 rounded">
-                      <input type="checkbox" checked={detectionSelected.includes(type)}
-                        onChange={()=>setDetectionSelected(prev=>prev.includes(type)?prev.filter(x=>x!==type):[...prev,type])}
-                        className="accent-indigo-500"/>
-                      <span className="text-xs">{type}</span>
-                    </label>
+                    <div key={type} className="flex items-center gap-1 hover:bg-gray-700 px-1 py-0.5 rounded">
+                      <label className="flex items-center gap-2 cursor-pointer text-sm flex-1 min-w-0">
+                        <input type="checkbox" checked={detectionSelected.includes(type)}
+                          onChange={()=>setDetectionSelected(prev=>prev.includes(type)?prev.filter(x=>x!==type):[...prev,type])}
+                          className="accent-indigo-500"/>
+                        <span className="text-xs">{type}</span>
+                      </label>
+                      {type==='Превышение скорости'&&(
+                        editingSpeedLimit?(
+                          <div className="flex items-center gap-1 ml-1">
+                            <input
+                              type="number" min="1" max="300"
+                              value={speedLimitInput}
+                              onChange={e=>setSpeedLimitInput(e.target.value)}
+                              onKeyDown={e=>{
+                                if(e.key==='Enter') {
+                                  const v=parseFloat(speedLimitInput);
+                                  if(!isNaN(v)&&v>0&&v<=300){
+                                    const token=localStorage.getItem('access_token');
+                                    fetch(`${import.meta.env.VITE_API_URL}/cameras/${encodeURIComponent(name)}/speed-limit`,{
+                                      method:'PATCH',
+                                      headers:{'Content-Type':'application/json',Authorization:`Bearer ${token}`},
+                                      body:JSON.stringify({speed_limit:v}),
+                                    }).then(r=>r.json()).then(d=>{if(d.ok){setSpeedLimit(v);toast(`Лимит скорости: ${v} км/ч`);}}).catch(()=>{});
+                                    setEditingSpeedLimit(false);
+                                  }
+                                }
+                                if(e.key==='Escape') setEditingSpeedLimit(false);
+                              }}
+                              className="w-16 text-xs px-1 py-0.5 rounded bg-gray-600 border border-gray-500 text-white"
+                              autoFocus/>
+                            <span className="text-xs text-gray-400">км/ч</span>
+                            <button onClick={()=>{
+                              const v=parseFloat(speedLimitInput);
+                              if(!isNaN(v)&&v>0&&v<=300){
+                                const token=localStorage.getItem('access_token');
+                                fetch(`${import.meta.env.VITE_API_URL}/cameras/${encodeURIComponent(name)}/speed-limit`,{
+                                  method:'PATCH',
+                                  headers:{'Content-Type':'application/json',Authorization:`Bearer ${token}`},
+                                  body:JSON.stringify({speed_limit:v}),
+                                }).then(r=>r.json()).then(d=>{if(d.ok){setSpeedLimit(v);toast(`Лимит скорости: ${v} км/ч`);}}).catch(()=>{});
+                              }
+                              setEditingSpeedLimit(false);
+                            }} className="text-xs text-green-400 hover:text-green-300">✓</button>
+                            <button onClick={()=>setEditingSpeedLimit(false)} className="text-xs text-gray-400 hover:text-white">✕</button>
+                          </div>
+                        ):(
+                          <button onClick={()=>{setSpeedLimitInput(String(speedLimit));setEditingSpeedLimit(true);}}
+                            className="text-xs text-indigo-400 hover:text-indigo-300 whitespace-nowrap ml-1">
+                            {speedLimit} км/ч
+                          </button>
+                        )
+                      )}
+                    </div>
                   ))}
                 </div>
               </div>

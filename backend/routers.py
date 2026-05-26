@@ -3,6 +3,7 @@ from fastapi.websockets import WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy import func
 from pydantic import EmailStr
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
@@ -12,7 +13,7 @@ import random
 import string
 
 from models import (
-    SessionLocal, User, Camera, Incident, SuperAdmin, Data,
+    SessionLocal, User, Camera, Incident, SuperAdmin, Data, AppSettings,
     EmailSchema, get_db, get_current_user, create_access_token,
     ph, INCIDENTS_PHOTOS_DIR, _get_camera_incidents,
 )
@@ -72,7 +73,10 @@ async def register_user(data: dict = Body(...), db: Session = Depends(get_db)):
     name     = data.get("name")
     email    = data.get("email")
     password = data.get("password")
-    print(name, email, password)
+
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(status_code=409, detail="Пользователь с таким email уже существует")
+
     hashed_password = ph.hash(password)
     verify_code = ''.join(random.choices(string.digits, k=6))
     db_user = User(
@@ -86,11 +90,16 @@ async def register_user(data: dict = Body(...), db: Session = Depends(get_db)):
         data     = {'counter': 0},
         requests = {}
     )
-    db.add(db_user)
-    db.add(db_data)
-    db.commit()
-    db.refresh(db_user)
-    db.refresh(db_data)
+    try:
+        db.add(db_user)
+        db.add(db_data)
+        db.commit()
+        db.refresh(db_user)
+        db.refresh(db_data)
+    except Exception as e:
+        db.rollback()
+        print(f"[register] Ошибка записи в БД: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка регистрации")
     try:
         send_email_sync(EmailSchema(
             to=email,
@@ -140,7 +149,6 @@ async def newcam(
     current_user: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    print(334)
     db_data = Camera(
         name  = Nname,
         coord = [float(x) for x in coord.split(', ')],
@@ -149,6 +157,20 @@ async def newcam(
     db.add(db_data)
     db.commit()
     db.refresh(db_data)
+
+
+@router.delete("/cameras/{name}")
+async def delete_camera(
+    name: str,
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    cam = db.query(Camera).filter(Camera.name == name).first()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Камера не найдена")
+    db.delete(cam)
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/user/profile")
@@ -193,6 +215,57 @@ async def remove_superadmin(email: str, db: Session = Depends(get_db)):
 @router.get("/superadmins")
 async def list_superadmins(db: Session = Depends(get_db)):
     return [a.email for a in db.query(SuperAdmin).all()]
+
+
+@router.get("/incidents/feed")
+async def list_incidents_feed(
+    cameras:   str  = Query(None),
+    types:     str  = Query(None),
+    time_from: str  = Query(None),
+    page:      int  = Query(1, ge=1),
+    page_size: int  = Query(12, ge=1, le=100),
+    has_photo:    bool = Query(False),
+    has_mistakes: bool = Query(False),
+    db: Session = Depends(get_db)
+):
+    q = db.query(Incident)
+    if has_photo:
+        q = q.filter(Incident.screenshot_name != None)
+    if has_mistakes:
+        q = q.filter(func.jsonb_array_length(Incident.mistake) > 0)
+    if cameras:
+        cam_list = [c.strip() for c in cameras.split(',') if c.strip()]
+        if cam_list:
+            q = q.filter(Incident.camera.in_(cam_list))
+    if types:
+        type_list = [t.strip() for t in types.split(',') if t.strip()]
+        if type_list:
+            q = q.filter(Incident.notification_text.in_(type_list))
+    if time_from:
+        try:
+            dt = datetime.fromisoformat(time_from.replace("Z", "+00:00"))
+            q  = q.filter(Incident.date >= dt)
+        except Exception:
+            pass
+    total = q.count()
+    items = q.order_by(Incident.date.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "total":     total,
+        "page":      page,
+        "page_size": page_size,
+        "items": [
+            {
+                "id":                inc.id,
+                "date":              inc.date.isoformat() if inc.date else None,
+                "camera":            inc.camera,
+                "notification_text": inc.notification_text,
+                "severity":          inc.severity,
+                "screenshot_name":   inc.screenshot_name,
+                "mistake":           inc.mistake or [],
+            }
+            for inc in items
+        ],
+    }
 
 
 @router.get("/incidents/{incident_id}")
@@ -347,6 +420,49 @@ async def stats_stream(ws: WebSocket, db: Session = Depends(get_db)):
         print("[ws/stats] Клиент отключился")
     except Exception as e:
         print(f"[ws/stats] Ошибка: {e}")
+
+
+@router.get("/admin/settings")
+async def get_settings(
+    current_user: str | bool = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    if not db.query(SuperAdmin).filter(SuperAdmin.email == current_user).first():
+        raise HTTPException(status_code=403, detail="Нет прав")
+    row = db.query(AppSettings).order_by(AppSettings.id).first()
+    return row.settings if row else {}
+
+
+@router.patch("/admin/settings")
+async def update_settings(
+    data: dict = Body(...),
+    current_user: str | bool = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    if not db.query(SuperAdmin).filter(SuperAdmin.email == current_user).first():
+        raise HTTPException(status_code=403, detail="Нет прав")
+    from sqlalchemy.orm.attributes import flag_modified
+    ALLOWED = {
+        "incident_save_cooldown", "camera_zones_refresh_interval",
+        "save_incident_screenshots", "default_speed_limit_kmh",
+        "base_px_per_meter", "acc_display_frames", "watchdog_interval",
+    }
+    row = db.query(AppSettings).order_by(AppSettings.id).first()
+    if not row:
+        row = AppSettings(settings={})
+        db.add(row)
+    current = dict(row.settings or {})
+    for k, v in data.items():
+        if k in ALLOWED:
+            current[k] = v
+    row.settings = current
+    flag_modified(row, "settings")
+    db.commit()
+    return {"ok": True, "settings": row.settings}
 
 
 @router.get("/notifications")

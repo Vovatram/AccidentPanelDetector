@@ -6,7 +6,7 @@ const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const INCIDENT_TYPES = [
   'Стоянка в неположенном месте', 'ДТП', 'Превышение скорости',
-  'Пешеход в неположенном месте', 'Затор', 'Движение по встречке', 'Сбитие пешехода',
+  'Пешеход на проезжей части вне перехода', 'Затор', 'Движение по встречке', 'Сбитие пешехода',
 ];
 
 const EVENT_COLORS = {
@@ -15,7 +15,7 @@ const EVENT_COLORS = {
   'Стоянка в неположенном месте':  '#f59e0b',
   'Превышение скорости':           '#facc15',
   'Затор':                         '#f97316',
-  'Пешеход в неположенном месте':  '#3b82f6',
+  'Пешеход на проезжей части вне перехода':  '#3b82f6',
   'Движение по встречке':          '#a855f7',
 };
 
@@ -29,6 +29,14 @@ const TIME_OPTIONS = [
 ];
 
 const PAGE_SIZE_OPTIONS = [12, 24, 48];
+const STORAGE_KEY = 'apd_photos_filters';
+
+function loadSaved() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; }
+}
+function saveSaved(data) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
+}
 
 const sevColor = s =>
   s === 0 ? '#6b7280' :
@@ -48,18 +56,24 @@ export default function Photos() {
   const D = theme === 'dark';
   const navigate = useNavigate();
 
+  const camerasLoadedRef = React.useRef(false);
+
   const [allCameras,   setAllCameras]   = useState([]);
   const [selCameras,   setSelCameras]   = useState([]);
-  const [selTypes,     setSelTypes]     = useState([...INCIDENT_TYPES]);
-  const [timeRange,    setTimeRange]    = useState(86400);
-  const [pageSize,     setPageSize]     = useState(12);
+  const [selTypes,     setSelTypes]     = useState(() => {
+    const s = loadSaved(); return Array.isArray(s.selTypes) ? s.selTypes : [...INCIDENT_TYPES];
+  });
+  const [timeRange,    setTimeRange]    = useState(() => loadSaved().timeRange ?? 86400);
+  const [pageSize,     setPageSize]     = useState(() => {
+    const n = loadSaved().pageSize; return PAGE_SIZE_OPTIONS.includes(n) ? n : 12;
+  });
   const [page,         setPage]         = useState(1);
   const [incidents,    setIncidents]    = useState([]);
   const [total,        setTotal]        = useState(0);
   const [loading,      setLoading]      = useState(false);
   const [camSearch,    setCamSearch]    = useState('');
   const [isSuperAdmin, setIsSuperAdmin] = useState(false);
-  const [hasMistakes,  setHasMistakes]  = useState(false);
+  const [hasMistakes,  setHasMistakes]  = useState(() => loadSaved().hasMistakes ?? false);
 
   useEffect(() => {
     const token = localStorage.getItem('access_token');
@@ -80,7 +94,14 @@ export default function Photos() {
       .then(d => {
         const keys = Object.keys(d);
         setAllCameras(keys);
-        setSelCameras(keys);
+        const saved = loadSaved();
+        if (Array.isArray(saved.selCameras) && saved.selCameras.length) {
+          const valid = saved.selCameras.filter(c => keys.includes(c));
+          setSelCameras(valid.length ? valid : keys);
+        } else {
+          setSelCameras(keys);
+        }
+        camerasLoadedRef.current = true;
       }).catch(() => {});
   }, []);
 
@@ -105,6 +126,11 @@ export default function Photos() {
   useEffect(() => { fetchPhotos(); }, [fetchPhotos]);
 
   useEffect(() => { setPage(1); }, [selCameras, selTypes, timeRange, pageSize, hasMistakes]);
+
+  useEffect(() => {
+    if (!camerasLoadedRef.current) return;
+    saveSaved({ selCameras, selTypes, timeRange, pageSize, hasMistakes });
+  }, [selCameras, selTypes, timeRange, pageSize, hasMistakes]);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
@@ -277,7 +303,15 @@ export default function Photos() {
         ) : (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16, flex: 1, alignContent: 'start' }}>
             {incidents.map(inc => (
-              <PhotoCard key={inc.id} inc={inc} D={D} navigate={navigate} />
+              <PhotoCard key={inc.id} inc={inc} D={D} navigate={navigate}
+                navState={{
+                  source: 'photos',
+                  cameras: selCameras,
+                  types: selTypes,
+                  timeFrom: timeRange > 0 ? new Date(Date.now() - timeRange * 1000).toISOString() : null,
+                  hasPhoto: true,
+                  hasMistakes,
+                }} />
             ))}
           </div>
         )}
@@ -300,12 +334,12 @@ export default function Photos() {
   );
 }
 
-function PhotoCard({ inc, D, navigate }) {
+function PhotoCard({ inc, D, navigate, navState }) {
   const color = EVENT_COLORS[inc.notification_text] || '#888';
 
   return (
     <div
-      onClick={() => navigate(`/incident/${inc.id}`)}
+      onClick={() => navigate(`/incident/${inc.id}`, { state: navState })}
       style={{
         background: D ? '#1e1e1e' : '#fff',
         borderRadius: 12, overflow: 'hidden', cursor: 'pointer',

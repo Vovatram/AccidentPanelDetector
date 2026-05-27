@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import axios from "axios";
 import useTheme from './useTheme';
 
@@ -28,6 +28,8 @@ function fmtShort(d) {
 export default function IncidentPage() {
   const { id }   = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const navCtx   = location.state || null;
   const [theme, setTheme] = useTheme();
   const D = theme === 'dark';
 
@@ -81,6 +83,31 @@ export default function IncidentPage() {
   const [showMistakes,    setShowMistakes]    = useState(false);
 
   const token = localStorage.getItem("access_token");
+
+  const [prevId, setPrevId] = useState(null);
+  const [nextId, setNextId] = useState(null);
+
+  useEffect(() => {
+    if (!navCtx) { setPrevId(null); setNextId(null); return; }
+    const p = new URLSearchParams();
+    if (navCtx.source === 'camera') {
+      p.set('cameras', navCtx.camera);
+      if (navCtx.timeFrom) p.set('time_from', navCtx.timeFrom);
+    } else if (navCtx.source === 'photos') {
+      if (navCtx.cameras?.length)  p.set('cameras',      navCtx.cameras.join(','));
+      if (navCtx.types?.length)    p.set('types',        navCtx.types.join(','));
+      if (navCtx.timeFrom)         p.set('time_from',    navCtx.timeFrom);
+      if (navCtx.hasPhoto)         p.set('has_photo',    'true');
+      if (navCtx.hasMistakes)      p.set('has_mistakes', 'true');
+    }
+    fetch(`${API}/incidents/${id}/adjacent?${p}`)
+      .then(r => r.json())
+      .then(d => { setPrevId(d.prev_id ?? null); setNextId(d.next_id ?? null); })
+      .catch(() => { setPrevId(null); setNextId(null); });
+  }, [id, navCtx]);
+
+  const goTo = targetId =>
+    navigate(`/incident/${targetId}`, { state: navCtx, replace: true });
 
   useEffect(() => {
     setLoading(true); setImgError(false);
@@ -224,16 +251,22 @@ export default function IncidentPage() {
       </div>
 
       {/* ── Навигация (внизу по центру) ── */}
-      <div className="absolute bottom-4 left-0 right-0 z-20 flex justify-center gap-3 pointer-events-none">
-        <button onClick={() => navigate(`/incident/${Number(id)-1}`, { replace: true })} disabled={Number(id) <= 1}
-          className="pointer-events-auto px-5 py-2 rounded-full bg-black/60 hover:bg-black/80 text-white text-sm disabled:opacity-30 backdrop-blur-sm transition-colors">
-          ← Пред.
-        </button>
-        <button onClick={() => navigate(`/incident/${Number(id)+1}`, { replace: true })}
-          className="pointer-events-auto px-5 py-2 rounded-full bg-black/60 hover:bg-black/80 text-white text-sm backdrop-blur-sm transition-colors">
-          След. →
-        </button>
-      </div>
+      {(prevId || nextId) && (
+        <div className="absolute bottom-4 left-0 right-0 z-20 flex justify-center gap-3 pointer-events-none">
+          {prevId && (
+            <button onClick={() => goTo(prevId)}
+              className="pointer-events-auto px-5 py-2 rounded-full bg-black/60 hover:bg-black/80 text-white text-sm backdrop-blur-sm transition-colors">
+              ← Пред.
+            </button>
+          )}
+          {nextId && (
+            <button onClick={() => goTo(nextId)}
+              className="pointer-events-auto px-5 py-2 rounded-full bg-black/60 hover:bg-black/80 text-white text-sm backdrop-blur-sm transition-colors">
+              След. →
+            </button>
+          )}
+        </div>
+      )}
 
       {/* ── Плавающая панель деталей ── */}
       {panelOpen && (
@@ -339,16 +372,22 @@ export default function IncidentPage() {
           </div>
 
           {/* Навигация */}
-          <div className="px-4 py-3 flex gap-2">
-            <button onClick={() => navigate(`/incident/${Number(id)-1}`, { replace: true })} disabled={Number(id) <= 1}
-              className={`flex-1 py-2 rounded-lg text-sm disabled:opacity-30 transition-colors ${D?'bg-gray-700 hover:bg-gray-600 text-white':'bg-gray-200 hover:bg-gray-300 text-gray-800'}`}>
-              ← Пред.
-            </button>
-            <button onClick={() => navigate(`/incident/${Number(id)+1}`, { replace: true })}
-              className={`flex-1 py-2 rounded-lg text-sm transition-colors ${D?'bg-gray-700 hover:bg-gray-600 text-white':'bg-gray-200 hover:bg-gray-300 text-gray-800'}`}>
-              След. →
-            </button>
-          </div>
+          {(prevId || nextId) && (
+            <div className="px-4 py-3 flex gap-2">
+              {prevId && (
+                <button onClick={() => goTo(prevId)}
+                  className={`flex-1 py-2 rounded-lg text-sm transition-colors ${D?'bg-gray-700 hover:bg-gray-600 text-white':'bg-gray-200 hover:bg-gray-300 text-gray-800'}`}>
+                  ← Пред.
+                </button>
+              )}
+              {nextId && (
+                <button onClick={() => goTo(nextId)}
+                  className={`flex-1 py-2 rounded-lg text-sm transition-colors ${D?'bg-gray-700 hover:bg-gray-600 text-white':'bg-gray-200 hover:bg-gray-300 text-gray-800'}`}>
+                  След. →
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

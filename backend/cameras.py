@@ -973,6 +973,7 @@ async def camera_worker(camera):
     MAX_ERRORS         = 10
     last_zones_refresh = 0.0
     _current_incidents = None
+    _current_work      = getattr(camera, 'work', True)
 
     _prev_zones = {
         "road_zones":      list(camera.road_zones      or []),
@@ -991,6 +992,7 @@ async def camera_worker(camera):
                     fresh = db.query(Camera).filter(Camera.id == camera.id).first()
                     if fresh:
                         _current_incidents = _get_camera_incidents(camera.id)
+                        _current_work      = fresh.work if fresh.work is not None else True
                         camera.speed_limit = fresh.speed_limit or SPEED_LIMIT_KMH
                         new_zones = {
                             "road_zones":      list(fresh.road_zones      or []),
@@ -1009,8 +1011,8 @@ async def camera_worker(camera):
                     db.close()
                 last_zones_refresh = now
 
-            if _current_incidents is False:
-                print(f"[camera_worker] Камера {camera.id} ({camera.name}): отключена, завершаю воркер")
+            if not _current_work:
+                print(f"[camera_worker] Камера {camera.id} ({camera.name}): work=false, завершаю воркер")
                 cap.release()
                 _running_camera_ids.discard(camera.id)
                 return
@@ -1160,8 +1162,7 @@ async def _camera_watchdog():
             for cam in cameras:
                 if cam.id in _running_camera_ids:
                     continue
-                inc = _get_camera_incidents(cam.id)
-                if inc is not False:
+                if cam.work:
                     print(f"[watchdog] Камера {cam.id} ({cam.name}): запускаю воркер")
                     _start_camera_worker(cam)
         except Exception as e:
@@ -1203,7 +1204,8 @@ async def video_stream(ws: WebSocket, db: Session = Depends(get_db)):
         if not camera_tasks_started:
             cameras = db.query(Camera).all()
             for cam in cameras:
-                asyncio.create_task(camera_worker(cam))
+                if cam.work:
+                    asyncio.create_task(camera_worker(cam))
             camera_tasks_started = True
 
         while camera_states.get(camera.id, {}).get("frame") is None:
@@ -1264,6 +1266,26 @@ async def set_camera_incidents(
     return {"ok": True}
 
 
+@router.post("/camera-work")
+async def set_camera_work(
+    data: dict = Body(...),
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    from fastapi import HTTPException
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+    admin = db.query(SuperAdmin).filter(SuperAdmin.email == current_user).first()
+    if not admin:
+        raise HTTPException(status_code=403, detail="Нет прав")
+    cam = db.query(Camera).filter(Camera.name == data.get("name", "")).first()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Камера не найдена")
+    cam.work = bool(data.get("work", True))
+    db.commit()
+    return {"ok": True}
+
+
 @router.get("/camera-zones")
 async def get_camera_zones(
     name: str,
@@ -1281,6 +1303,7 @@ async def get_camera_zones(
         "lane_lines":      camera.lane_lines or [],
         "incidents":       _get_camera_incidents(camera.id),
         "speed_limit":     camera.speed_limit if camera.speed_limit is not None else 60,
+        "work":            camera.work if camera.work is not None else True,
     }
 
 

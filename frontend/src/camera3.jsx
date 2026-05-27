@@ -5,12 +5,12 @@ import useTheme from './useTheme';
 
 const INCIDENT_TYPES = [
   'Стоянка в неположенном месте','ДТП','Превышение скорости',
-  'Пешеход в неположенном месте','Затор','Движение по встречке','Сбитие пешехода'
+  'Пешеход на проезжей части вне перехода','Затор','Движение по встречке','Сбитие пешехода'
 ];
 const BACKEND_TO_DISPLAY = {
   traffic_jam:  'Затор',
   illegal_stop: 'Стоянка в неположенном месте',
-  pedestrian:   'Пешеход в неположенном месте',
+  pedestrian:   'Пешеход на проезжей части вне перехода',
   accident:     'ДТП',
   wrong_way:    'Движение по встречке',
   speeding:     'Превышение скорости',
@@ -186,8 +186,17 @@ function Camera() {
   // Панель
   const [activePanel, setActivePanel] = useState(null);
 
-  // Обводки на видео
-  const [displaySelected, setDisplaySelected] = useState([...DETECTABLE]);
+  // Обводки на видео — сохраняем в localStorage, чтобы не сбрасывались при перезагрузке / переключении камеры
+  const [displaySelected, setDisplaySelected] = useState(() => {
+    try {
+      const stored = localStorage.getItem(`apd_display_${name}`);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {}
+    return [...DETECTABLE];
+  });
 
   // Происшествия — храним от новых к старым (индекс 0 = новейший)
   const [incidents, setIncidents]           = useState([]);
@@ -231,10 +240,17 @@ function Camera() {
   const isAuthRef        = useRef(isAuthenticated);
   const processCameraRef = useRef(true);
   const detectionRef     = useRef([...DETECTABLE]);
-  const displayRef       = useRef([...DETECTABLE]);
+  // Инициализируем displayRef сразу с актуальным значением из localStorage (через displaySelected),
+  // чтобы первый connectVideoWs() уже отправлял правильные display_filters, не дожидаясь эффекта
+  const displayRef       = useRef(displaySelected);
   const videoReconnTimer = useRef(null);
   // Флаг: подписки только что пришли с сервера, не отправлять update_subscriptions
   const subsFromServerRef  = useRef(false);
+  // Флаг: состояние детекции уже инициализировано из БД для текущей камеры
+  const cameraZonesInitedRef = useRef(false);
+  // Флаг первого рендера: на initial-mount processCamera-эффект не должен вызывать connectVideoWs,
+  // потому что эффект [name] уже делает это; только пользовательские изменения processCamera — connect/disconnect
+  const processCameraFirstRunRef = useRef(true);
   // Реф для isSuperAdmin — чтобы читать актуальное значение в эффектах без лишних зависимостей
   const isSuperAdminRef    = useRef(false);
   useEffect(() => { isSuperAdminRef.current = isSuperAdmin; }, [isSuperAdmin]);
@@ -244,6 +260,31 @@ function Camera() {
   useEffect(()=>{ processCameraRef.current = processCamera;    },[processCamera]);
   useEffect(()=>{ detectionRef.current     = detectionSelected;},[detectionSelected]);
   useEffect(()=>{ displayRef.current       = displaySelected;  },[displaySelected]);
+  // Сохраняем displaySelected в localStorage при каждом изменении
+  useEffect(()=>{
+    try { localStorage.setItem(`apd_display_${name}`, JSON.stringify(displaySelected)); } catch {}
+  },[displaySelected]);
+  // При смене камеры — сбрасываем флаги и состояние камеры
+  // (React Router не ремаунтит компонент при смене :name, поэтому сбрасываем вручную)
+  useEffect(()=>{
+    cameraZonesInitedRef.current     = false;
+    processCameraFirstRunRef.current = true;
+    setProcessCamera(true);              // camera-zones перезапишет, если нужно
+    setDetectionSelected([...DETECTABLE]);
+    // Загружаем display-настройки для новой камеры из localStorage.
+    // Обновляем displayRef.current сразу же (до того как [name]-эффект вызовет connectVideoWs),
+    // чтобы первый WS-кадр получил правильные display_filters.
+    let newDisplay = [...DETECTABLE];
+    try {
+      const stored = localStorage.getItem(`apd_display_${name}`);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) newDisplay = parsed;
+      }
+    } catch {}
+    displayRef.current = newDisplay;
+    setDisplaySelected(newDisplay);
+  },[name]);
 
   const T = {
     dark:  {bg:'bg-gray-900',text:'text-white',cardBg:'bg-gray-800',border:'border-gray-700',btn:'bg-gray-700 hover:bg-gray-600',input:'bg-gray-700 text-white border-gray-600'},
@@ -296,16 +337,24 @@ function Camera() {
         const has = (d.road_zones?.length>0)||(d.stop_zones?.length>0)||(d.crosswalk_zones?.length>0);
         setHasZones(has);
         if (d.speed_limit != null) { setSpeedLimit(d.speed_limit); setSpeedLimitInput(String(d.speed_limit)); }
-        // Инициализируем processCamera из столбца incidents для всех пользователей
-        const inc = d.incidents;
-        if (inc === false) {
-          setProcessCamera(false);
-        } else if (isSuperAdmin && Array.isArray(inc) && inc.length > 0) {
-          setProcessCamera(true);
-          const displayNames = inc.map(k => BACKEND_TO_DISPLAY[k]).filter(Boolean);
-          if (displayNames.length) setDetectionSelected(displayNames);
+        // Инициализируем processCamera / detectionSelected из столбца incidents
+        // Только при первой загрузке камеры (флаг cameraZonesInitedRef),
+        // чтобы не затирать ручные изменения пользователя при повторном срабатывании эффекта
+        if (!cameraZonesInitedRef.current) {
+          if (d.work === false) setProcessCamera(false);
+          const inc = d.incidents;
+          if (Array.isArray(inc)) {
+            if (isSuperAdmin) {
+              const displayNames = inc.map(k => BACKEND_TO_DISPLAY[k]).filter(Boolean);
+              setDetectionSelected(displayNames);
+              cameraZonesInitedRef.current = true;
+            }
+            // else: эффект перезапустится когда isSuperAdmin станет true
+          } else {
+            // null → оставляем дефолт (всё включено)
+            cameraZonesInitedRef.current = true;
+          }
         }
-        // null → оставляем дефолт (всё включено)
       })
       .catch(()=>{});
   }, [name, isSuperAdmin]);
@@ -361,6 +410,11 @@ function Camera() {
 
   // вкл/выкл камеры + сохранение в БД (только суперадмин)
   useEffect(() => {
+    // На первом рендере начальное подключение уже выполнено эффектом [name]; пропускаем
+    if (processCameraFirstRunRef.current) {
+      processCameraFirstRunRef.current = false;
+      return;
+    }
     if (!processCamera) {
       clearTimeout(videoReconnTimer.current);
       if (videoWsRef.current) { videoWsRef.current.onclose = null; videoWsRef.current.close(); }
@@ -370,14 +424,13 @@ function Camera() {
     }
     if (!isSuperAdminRef.current) return;
     const token = localStorage.getItem('access_token');
-    const incidents = processCamera
-      ? detectionRef.current.map(d => DISPLAY_TO_BACKEND[d]).filter(Boolean)
-      : false;
-    fetch(`${import.meta.env.VITE_API_URL}/camera-incidents`, {
+    fetch(`${import.meta.env.VITE_API_URL}/camera-work`, {
       method: 'POST',
       headers: {'Content-Type':'application/json', Authorization:`Bearer ${token}`},
-      body: JSON.stringify({name, incidents}),
-    }).catch(()=>{});
+      body: JSON.stringify({name, work: processCamera}),
+    })
+      .then(r => { if (!r.ok) toast(`Ошибка сохранения состояния камеры (${r.status})`); })
+      .catch(() => toast('Ошибка соединения'));
   }, [processCamera, connectVideoWs, name]);
 
   // обновить display_filters на лету
@@ -392,15 +445,16 @@ function Camera() {
     const ws = videoWsRef.current;
     if (ws?.readyState === WebSocket.OPEN)
       ws.send(JSON.stringify({type:'set_filters', filters:computeBackendFilters(detectionSelected)}));
-    // Сохраняем в БД только если суперадмин и камера включена
-    if (!isSuperAdminRef.current || !processCameraRef.current) return;
+    if (!isSuperAdminRef.current) return;
     const token = localStorage.getItem('access_token');
     const incidents = detectionSelected.map(d => DISPLAY_TO_BACKEND[d]).filter(Boolean);
     fetch(`${import.meta.env.VITE_API_URL}/camera-incidents`, {
       method: 'POST',
       headers: {'Content-Type':'application/json', Authorization:`Bearer ${token}`},
       body: JSON.stringify({name, incidents}),
-    }).catch(()=>{});
+    })
+      .then(r => { if (!r.ok) toast(`Ошибка сохранения настроек (${r.status})`); })
+      .catch(() => toast('Ошибка соединения при сохранении настроек'));
   }, [detectionSelected, name]);
 
   // ── WS уведомлений с автопереподключением ────────────────────────────────
@@ -642,7 +696,7 @@ function Camera() {
             <button onClick={()=>navigate(`/statistics/${encodeURIComponent(name)}`)}
               className={`w-9 h-9 rounded-full ${T.btn} flex items-center justify-center hover:scale-105 transition-all`}
               title="Статистика">📊</button>
-            <button onClick={()=>setTheme(p=>p==='dark'?'light':'dark')}
+            <button onClick={()=>setTheme(theme==='dark'?'light':'dark')}
               className={`w-9 h-9 rounded-full ${T.btn} flex items-center justify-center hover:scale-105 transition-all`}>
               {theme==='dark'?'☀️':'🌙'}
             </button>
@@ -884,7 +938,7 @@ function Camera() {
               </div>
             ) : filteredIncidents.map(inc=>(
               <div key={inc.id}
-                onClick={()=>navigate(`/incident/${inc.id}`)}
+                onClick={()=>navigate(`/incident/${inc.id}`, { state: { source:'camera', camera:name, timeFrom: timeRange>0 ? new Date(Date.now()-timeRange*1000).toISOString() : null } })}
                 className={`p-2.5 rounded ${T.btn} text-sm cursor-pointer hover:ring-1 hover:ring-indigo-400 transition-all`}>
                 <div className="flex items-start justify-between gap-2">
                   <span className="font-semibold flex-1 text-xs">{inc.type}</span>

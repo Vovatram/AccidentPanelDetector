@@ -3,7 +3,7 @@ from fastapi.websockets import WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_
 from pydantic import EmailStr
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
@@ -268,6 +268,59 @@ async def list_incidents_feed(
     }
 
 
+@router.get("/incidents/{incident_id}/adjacent")
+async def get_adjacent_incidents(
+    incident_id: int,
+    cameras:      str  = Query(None),
+    types:        str  = Query(None),
+    time_from:    str  = Query(None),
+    has_photo:    bool = Query(False),
+    has_mistakes: bool = Query(False),
+    db: Session = Depends(get_db)
+):
+    inc = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Не найден")
+
+    def base_q():
+        q = db.query(Incident.id, Incident.date)
+        if has_photo:
+            q = q.filter(Incident.screenshot_name != None)
+        if has_mistakes:
+            q = q.filter(func.jsonb_array_length(Incident.mistake) > 0)
+        if cameras:
+            cam_list = [c.strip() for c in cameras.split(',') if c.strip()]
+            if cam_list:
+                q = q.filter(Incident.camera.in_(cam_list))
+        if types:
+            type_list = [t.strip() for t in types.split(',') if t.strip()]
+            if type_list:
+                q = q.filter(Incident.notification_text.in_(type_list))
+        if time_from:
+            try:
+                dt = datetime.fromisoformat(time_from.replace("Z", "+00:00"))
+                q = q.filter(Incident.date >= dt)
+            except Exception:
+                pass
+        return q
+
+    # Список отсортирован date DESC, id DESC → «пред» = старее, «след» = новее
+    prev_row = base_q().filter(
+        or_(Incident.date < inc.date,
+            and_(Incident.date == inc.date, Incident.id < inc.id))
+    ).order_by(Incident.date.desc(), Incident.id.desc()).first()
+
+    next_row = base_q().filter(
+        or_(Incident.date > inc.date,
+            and_(Incident.date == inc.date, Incident.id > inc.id))
+    ).order_by(Incident.date.asc(), Incident.id.asc()).first()
+
+    return {
+        "prev_id": prev_row[0] if prev_row else None,
+        "next_id": next_row[0] if next_row else None,
+    }
+
+
 @router.get("/incidents/{incident_id}")
 async def get_incident(incident_id: int, db: Session = Depends(get_db)):
     inc = db.query(Incident).filter(Incident.id == incident_id).first()
@@ -326,7 +379,7 @@ async def stats_stream(ws: WebSocket, db: Session = Depends(get_db)):
     TEXT_TO_TYPE = {
         "Затор":                                  "Затор",
         "Стоянка в неположенном месте":           "Стоянка в неположенном месте",
-        "Пешеход на проезжей части вне перехода": "Пешеход в неположенном месте",
+        "Пешеход на проезжей части вне перехода": "Пешеход на проезжей части вне перехода",
     }
 
     async def compute_and_send(params):

@@ -1,6 +1,6 @@
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, text
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, Boolean, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import sessionmaker, Session
@@ -76,6 +76,7 @@ class Camera(Base):
     crosswalk_zones = Column(JSONB, nullable=False, server_default='[]')
     lane_lines      = Column(JSONB, nullable=False, server_default='[]')
     speed_limit     = Column(Float, nullable=False, server_default='60')
+    work            = Column(Boolean, nullable=False, server_default='true')
 
 
 class Incident(Base):
@@ -183,6 +184,7 @@ def run_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified VARCHAR(64)",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verify_code VARCHAR(64)",
             "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS speed_limit FLOAT NOT NULL DEFAULT 60",
+            "ALTER TABLE cameras ADD COLUMN IF NOT EXISTS work BOOLEAN NOT NULL DEFAULT true",
             "SELECT setval('cameras_id_seq', GREATEST((SELECT COALESCE(MAX(id),0) FROM cameras), 1))",
             "SELECT setval('users_id_seq',   GREATEST((SELECT COALESCE(MAX(id),0) FROM users),   1))",
             "SELECT setval('data_id_seq',    GREATEST((SELECT COALESCE(MAX(id),0) FROM data),    1))",

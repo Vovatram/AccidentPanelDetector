@@ -140,6 +140,22 @@ def _in_mask(mask: np.ndarray, cx: int, cy: int) -> bool:
     return bool(mask[min(cy, h-1), min(cx, w-1)] == 255)
 
 
+def _point_in_zone(px: float, py: float, polygon: list) -> bool:
+    """Ray-casting point-in-polygon. Используется для привязки стрелок к зонам."""
+    n = len(polygon)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(polygon[i][0]), float(polygon[i][1])
+        xj, yj = float(polygon[j][0]), float(polygon[j][1])
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
 # ── Детекторы ─────────────────────────────────────────────────────────────────
 
 def _detect_traffic_jam(frame: np.ndarray, results, camera, state: dict) -> dict:
@@ -476,8 +492,8 @@ def _detect_accident(frame: np.ndarray, results, camera, state: dict) -> dict:
 # ── Детектор движения по встречке ─────────────────────────────────────────────
 
 def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
-    road_zones  = getattr(camera, "road_zones",  None) or []
-    lane_lines  = getattr(camera, "lane_lines",  None) or []
+    road_zones = getattr(camera, "road_zones", None) or []
+    lane_lines = getattr(camera, "lane_lines", None) or []
 
     if not lane_lines:
         return {"violations": [], "road_zones": road_zones, "lane_lines": lane_lines}
@@ -485,15 +501,41 @@ def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
     mask     = _build_road_mask(frame, road_zones)
     use_mask = bool(road_zones)
 
-    track_pos  : dict = state.setdefault("_ww_pos",    {})
-    active_viol: dict = state.setdefault("_ww_active", {})  # tid -> expire_frame
+    track_pos  : dict = state.setdefault("_ww_pos",       {})
+    active_viol: dict = state.setdefault("_ww_active",    {})  # tid -> expire_frame
+    last_seen  : dict = state.setdefault("_ww_last_seen", {})  # tid -> frame_num
     frame_num  : int  = state.get("_ww_frame_num", 0)
 
-    VEHICLE_CLS  = {2, 3, 5, 7}
-    MIN_HISTORY  = 10
-    MIN_MOVE_PX  = 15
-    DOT_THRESH   = -0.35   # cos угла > 110° → встречное движение
-    VIOL_EXPIRE  = 90      # кадров отображения нарушения
+    VEHICLE_CLS = {2, 3, 5, 7}
+    MIN_HISTORY = 10
+    MIN_MOVE_PX = 15
+    DOT_THRESH  = -0.35   # cos(>110°) → встречное направление
+    VIOL_EXPIRE = 90      # кадров показа нарушения
+    STALE_AFTER = 150     # кадров до удаления истории пропавшего трека
+
+    # ── Предвычисляем направления стрелок + к какой road_zone принадлежит каждая ──
+    lane_dirs: list = []
+    for lane in lane_lines:
+        if len(lane) < 2:
+            continue
+        ldx = lane[1][0] - lane[0][0]
+        ldy = lane[1][1] - lane[0][1]
+        ln  = math.sqrt(ldx*ldx + ldy*ldy)
+        if ln < 1:
+            continue
+        mx  = (lane[0][0] + lane[1][0]) / 2
+        my  = (lane[0][1] + lane[1][1]) / 2
+        # Определяем, в какую road_zone попадает середина стрелки (-1 = ни в одну)
+        arrow_zone = -1
+        for zi, zone in enumerate(road_zones):
+            if _point_in_zone(mx, my, zone):
+                arrow_zone = zi
+                break
+        lane_dirs.append({"dir": (ldx/ln, ldy/ln), "mx": mx, "my": my, "zone": arrow_zone})
+
+    if not lane_dirs:
+        state["_ww_frame_num"] = frame_num + 1
+        return {"violations": [], "road_zones": road_zones, "lane_lines": lane_lines}
 
     violations  = []
     current_ids = set()
@@ -502,20 +544,6 @@ def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
         boxes     = results.boxes.xyxy.cpu().numpy()
         track_ids = results.boxes.id.cpu().numpy().astype(int)
         classes   = results.boxes.cls.cpu().numpy().astype(int)
-
-        # Нормированные направления каждой стрелки (однократно)
-        lane_dirs = []
-        for lane in lane_lines:
-            if len(lane) < 2:
-                continue
-            ldx = lane[1][0] - lane[0][0]
-            ldy = lane[1][1] - lane[0][1]
-            ln  = math.sqrt(ldx*ldx + ldy*ldy)
-            if ln < 1:
-                continue
-            mx  = (lane[0][0] + lane[1][0]) / 2
-            my  = (lane[0][1] + lane[1][1]) / 2
-            lane_dirs.append({"dir": (ldx/ln, ldy/ln), "mx": mx, "my": my})
 
         for box, tid, cls in zip(boxes, track_ids, classes):
             if cls not in VEHICLE_CLS:
@@ -526,6 +554,8 @@ def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
                 continue
 
             current_ids.add(tid)
+            last_seen[tid] = frame_num
+
             if tid not in track_pos:
                 track_pos[tid] = deque(maxlen=25)
             track_pos[tid].append((float(cx), float(cy)))
@@ -537,32 +567,45 @@ def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
                 mv  = math.sqrt(dx*dx + dy*dy)
                 if mv >= MIN_MOVE_PX:
                     vx, vy = dx/mv, dy/mv
-                    # Ближайшая стрелка к транспортному средству
+
+                    # Определяем road_zone автомобиля для привязки к нужной стрелке
+                    vehicle_zone = -1
+                    for zi, zone in enumerate(road_zones):
+                        if _point_in_zone(cx, cy, zone):
+                            vehicle_zone = zi
+                            break
+
+                    # Ищем ближайшую стрелку из той же зоны.
+                    # Если ни у авто, ни у стрелки нет зоны — берём ближайшую из любой.
                     best_dot  = 1.0
                     best_dist = float('inf')
                     for ld in lane_dirs:
+                        # Пропускаем стрелки из чужих полос (предотвращает ложные срабатывания
+                        # на двухсторонних дорогах, где стрелки двух полос рядом)
+                        if vehicle_zone != -1 and ld["zone"] != -1 and ld["zone"] != vehicle_zone:
+                            continue
                         d = math.sqrt((cx - ld["mx"])**2 + (cy - ld["my"])**2)
                         if d < best_dist:
                             best_dist = d
                             best_dot  = vx*ld["dir"][0] + vy*ld["dir"][1]
+
                     if best_dot < DOT_THRESH:
                         active_viol[tid] = frame_num + VIOL_EXPIRE
 
             if active_viol.get(tid, -1) >= frame_num:
                 violations.append({"box": tuple(map(int, box)), "track_id": tid})
 
-        # Очищаем устаревшие нарушения потерянных треков
-        for tid in list(track_pos.keys()):
-            if tid not in current_ids:
-                track_pos[tid]  # оставляем историю, deque сам ограничивает
+    # ── Очистка историй пропавших треков ─────────────────────────────────────────
+    for tid in list(track_pos.keys()):
+        if tid not in current_ids:
+            if frame_num - last_seen.get(tid, 0) > STALE_AFTER:
+                del track_pos[tid]
+                last_seen.pop(tid, None)
 
-    # Показываем активные нарушения (треки, которые вышли из поля зрения, но ещё «горят»)
-    already = {v["track_id"] for v in violations}
+    # ── Очистка истёкших нарушений ────────────────────────────────────────────────
     for tid, exp in list(active_viol.items()):
         if exp < frame_num:
             del active_viol[tid]
-        elif tid not in already and tid not in current_ids:
-            pass  # трек потерян — не добавляем призрак
 
     state["_ww_frame_num"] = frame_num + 1
     return {"violations": violations, "road_zones": road_zones, "lane_lines": lane_lines}
@@ -848,7 +891,7 @@ def _reset_detector_state(worker_state: dict):
         "_tj_vehicles", "_tj_last_boxes", "_tj_frame_count",
         "_acc_history", "_acc_col_ids", "_acc_confirmed", "_acc_active",
         "_acc_frames_after", "_acc_saved_ids", "_acc_display_box",
-        "_ww_pos", "_ww_active", "_ww_frame_num",
+        "_ww_pos", "_ww_active", "_ww_frame_num", "_ww_last_seen",
         "_spd_vehicles", "_spd_last_boxes",
     ]
     for k in keys_to_clear:

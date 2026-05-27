@@ -92,7 +92,11 @@ import { useNavigate } from "react-router-dom"  // если используеш
         
       return (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}>
+          <div
+            className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
             <h2 className="text-2xl font-bold text-center mb-6">Вход</h2>
             <div className="mb-4">
               <input
@@ -196,7 +200,11 @@ function RegisterPanel({ onSubmit, theme }) {
 
       return (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}>
+          <div
+            className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
             <h2 className="text-2xl font-bold text-center mb-6">Регистрация</h2>
             <div className="mb-4">
               <input
@@ -271,7 +279,11 @@ function RegisterPanel({ onSubmit, theme }) {
 
       return (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}>
+          <div
+            className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
             <h2 className="text-2xl font-bold text-center mb-6">Подтверждение кода</h2>
             <p className="text-center mb-4">Код отправлен на {email}</p>
             <div className="mb-4">
@@ -305,7 +317,11 @@ function RegisterPanel({ onSubmit, theme }) {
     function SuccessPanel({ onClose, theme }) {
       return (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}>
+          <div
+            className={`${theme === 'dark' ? 'bg-gray-800 bg-opacity-80' : 'bg-white bg-opacity-90'} p-8 rounded-lg shadow-lg w-full max-w-md`}
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
             <h2 className="text-2xl font-bold text-center mb-6">Успех!</h2>
             <p className="text-center mb-4">Вы успешно зарегистрировались!</p>
             <div className="flex justify-center">
@@ -331,7 +347,7 @@ function RegisterPanel({ onSubmit, theme }) {
       const [name, setName] = React.useState('');
       const [password, setPassword] = React.useState('');
       const [theme, setTheme] = useState(otheme(param.theme));
-      useEffect(() => {setTheme(otheme(param.theme))})
+      useEffect(() => {setTheme(otheme(param.theme))}, [param.theme])
 
       const generateCode = () => {
         return Math.floor(100000 + Math.random() * 900000).toString();

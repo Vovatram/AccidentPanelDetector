@@ -19,7 +19,7 @@ ACC_DISPLAY_FRAMES = 270
 
 # BGR цвета инцидентов (OpenCV использует BGR, пользователь задал RGB)
 INC_COLORS = {
-    "traffic_jam":  (0,   255, 247),   # RGB 247,255,0
+    "traffic_jam":  (0,    90, 185),   # тёмный янтарный RGB 185,90,0
     "illegal_stop": (118,   0, 255),   # RGB 255,0,118
     "pedestrian":   (255,  39,   0),   # RGB 0,39,255
     "accident":     (37,    0, 237),   # RGB 237,0,37
@@ -702,11 +702,47 @@ def draw_incidents(frame: np.ndarray, incidents: dict, filters: list[str]) -> np
                 result = _label_box(result, f"Затор  {jam['avg_speed']:.0f} км/ч  ({jam['vehicle_count']} авт.)", x1, y1, COLOR)
 
         elif key == "illegal_stop":
-            COLOR = INC_COLORS["illegal_stop"]
-            for v in data.get("violations", []):
-                x1, y1, x2, y2 = v["box"]
-                cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)
-                result = _label_box(result, "Стоянка в неположенном месте", x1, y1, COLOR)
+            COLOR      = INC_COLORS["illegal_stop"]
+            JAM_COLOR  = INC_COLORS["traffic_jam"]
+            violations = data.get("violations", [])
+            PROX       = 150  # пикселей — порог объединения стоянок в затор
+
+            # BFS-группировка нарушений по близости
+            n       = len(violations)
+            centers = [((v["box"][0]+v["box"][2])//2, (v["box"][1]+v["box"][3])//2) for v in violations]
+            visited = [False] * n
+            groups: list = []
+            for start in range(n):
+                if visited[start]:
+                    continue
+                grp = [start]; visited[start] = True; queue = [start]
+                while queue:
+                    curr = queue.pop(0)
+                    cx0, cy0 = centers[curr]
+                    for j in range(n):
+                        if visited[j]:
+                            continue
+                        jx, jy = centers[j]
+                        if math.sqrt((cx0-jx)**2 + (cy0-jy)**2) < PROX:
+                            visited[j] = True; grp.append(j); queue.append(j)
+                groups.append([violations[i] for i in grp])
+
+            for grp in groups:
+                if len(grp) >= 2:
+                    # Несколько стоянок рядом → один затор
+                    bx1 = min(v["box"][0] for v in grp)
+                    by1 = min(v["box"][1] for v in grp)
+                    bx2 = max(v["box"][2] for v in grp)
+                    by2 = max(v["box"][3] for v in grp)
+                    overlay = result.copy()
+                    cv2.rectangle(overlay, (bx1, by1), (bx2, by2), JAM_COLOR, -1)
+                    cv2.addWeighted(overlay, 0.3, result, 0.7, 0, result)
+                    cv2.rectangle(result, (bx1, by1), (bx2, by2), JAM_COLOR, 2)
+                    result = _label_box(result, f"Затор (стоянки)  {len(grp)} авт.", bx1, by1, JAM_COLOR)
+                else:
+                    x1, y1, x2, y2 = grp[0]["box"]
+                    cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)
+                    result = _label_box(result, "Стоянка в неположенном месте", x1, y1, COLOR)
 
         elif key == "pedestrian":
             COLOR = INC_COLORS["pedestrian"]
@@ -726,16 +762,8 @@ def draw_incidents(frame: np.ndarray, incidents: dict, filters: list[str]) -> np
                 result = _label_box(result, "ДТП", x1, y1, COLOR)
 
         elif key == "wrong_way":
-            COLOR      = INC_COLORS["wrong_way"]
-            LANE_COLOR = (255, 180, 0)
-            for lane in data.get("lane_lines", []):
-                if len(lane) >= 2:
-                    cv2.arrowedLine(
-                        result,
-                        (int(lane[0][0]), int(lane[0][1])),
-                        (int(lane[1][0]), int(lane[1][1])),
-                        LANE_COLOR, 2, tipLength=0.3,
-                    )
+            # Стрелки направления НЕ рисуются на живом кадре (только в редакторе зон)
+            COLOR = INC_COLORS["wrong_way"]
             for v in data.get("violations", []):
                 x1, y1, x2, y2 = v["box"]
                 cv2.rectangle(result, (x1, y1), (x2, y2), COLOR, 2)

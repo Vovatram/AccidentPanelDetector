@@ -21,7 +21,7 @@ CAMERA_ZONES_REFRESH_INTERVAL = 10
 INCIDENTS_PHOTOS_DIR          = "incidents"
 SAVE_INCIDENT_SCREENSHOTS     = True
 
-DATABASE_URL = "postgresql://postgres:1234@localhost:5432/apd"
+DATABASE_URL = "postgresql://postgres:Metro1935)@localhost:5432/apd"
 
 engine       = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

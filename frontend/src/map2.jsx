@@ -152,11 +152,11 @@ const AuthModal = ({ onClose, onSuccess }) => {
   };
 
   return (
-    <div onClick={e => e.target === e.currentTarget && onClose()} style={{
+    <div onMouseDown={e => e.target === e.currentTarget && onClose()} style={{
       position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
       display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3000
     }}>
-      <div style={{ background: '#1e2433', color: 'white', borderRadius: 12, padding: 24, width: '100%', maxWidth: 360, border: '1px solid #374151', boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }}>
+      <div onMouseDown={e => e.stopPropagation()} style={{ background: '#1e2433', color: 'white', borderRadius: 12, padding: 24, width: '100%', maxWidth: 360, border: '1px solid #374151', boxShadow: '0 20px 60px rgba(0,0,0,0.5)' }}>
         {tab === 'verify' ? (
           <>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>

@@ -502,51 +502,30 @@ def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
     use_mask = bool(road_zones)
 
     track_pos  : dict = state.setdefault("_ww_pos",       {})
-    active_viol: dict = state.setdefault("_ww_active",    {})  # tid -> expire_frame
-    last_seen  : dict = state.setdefault("_ww_last_seen", {})  # tid -> frame_num
+    active_viol: dict = state.setdefault("_ww_active",    {})
+    last_seen  : dict = state.setdefault("_ww_last_seen", {})
     frame_num  : int  = state.get("_ww_frame_num", 0)
 
     VEHICLE_CLS = {2, 3, 5, 7}
     MIN_HISTORY = 10
-    MIN_MOVE_PX = 15
-    DOT_THRESH  = -0.35   # cos(>110°) → встречное направление
-    VIOL_EXPIRE = 90      # кадров показа нарушения
-    STALE_AFTER = 150     # кадров до удаления истории пропавшего трека
+    MIN_MOVE_PX = 35
+    DOT_THRESH  = -0.35
+    VIOL_EXPIRE = 90
+    STALE_AFTER = 150
 
-    # ── Предвычисляем направления стрелок + к какой road_zone принадлежит каждая ──
-    # Каждой стрелке жёстко назначается зона:
-    #   1) точное вхождение середины стрелки в полигон зоны
-    #   2) если не попала — ближайшая зона по центроиду (фоллбэк)
-    lane_dirs: list = []
+    # road_zones[i] ↔ lane_lines[i]: предвычисляем нормированный вектор для каждой линии
+    lane_dirs: list = []  # lane_dirs[i] = (dx, dy) или None если линия некорректна
     for lane in lane_lines:
         if len(lane) < 2:
+            lane_dirs.append(None)
             continue
         ldx = lane[1][0] - lane[0][0]
         ldy = lane[1][1] - lane[0][1]
-        ln  = math.sqrt(ldx*ldx + ldy*ldy)
-        if ln < 1:
-            continue
-        mx  = (lane[0][0] + lane[1][0]) / 2
-        my  = (lane[0][1] + lane[1][1]) / 2
-        # Шаг 1: точное вхождение
-        arrow_zone = -1
-        for zi, zone in enumerate(road_zones):
-            if _point_in_zone(mx, my, zone):
-                arrow_zone = zi
-                break
-        # Шаг 2: фоллбэк — ближайшая зона по центроиду
-        if arrow_zone == -1 and road_zones:
-            min_zd = float('inf')
-            for zi, zone in enumerate(road_zones):
-                zx = sum(p[0] for p in zone) / len(zone)
-                zy = sum(p[1] for p in zone) / len(zone)
-                d  = math.sqrt((mx - zx)**2 + (my - zy)**2)
-                if d < min_zd:
-                    min_zd     = d
-                    arrow_zone = zi
-        lane_dirs.append({"dir": (ldx/ln, ldy/ln), "mx": mx, "my": my, "zone": arrow_zone})
+        ln  = math.sqrt(ldx * ldx + ldy * ldy)
+        lane_dirs.append((ldx / ln, ldy / ln) if ln >= 1 else None)
 
-    if not lane_dirs:
+    all_valid_dirs = [d for d in lane_dirs if d is not None]
+    if not all_valid_dirs:
         state["_ww_frame_num"] = frame_num + 1
         return {"violations": [], "road_zones": road_zones, "lane_lines": lane_lines}
 
@@ -562,7 +541,7 @@ def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
             if cls not in VEHICLE_CLS:
                 continue
             tid = int(tid)
-            cx, cy = int((box[0]+box[2])/2), int((box[1]+box[3])/2)
+            cx, cy = int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2)
             if use_mask and not _in_mask(mask, cx, cy):
                 continue
 
@@ -577,72 +556,33 @@ def _detect_wrong_way(frame: np.ndarray, results, camera, state: dict) -> dict:
                 pts = list(track_pos[tid])
                 dx  = pts[-1][0] - pts[0][0]
                 dy  = pts[-1][1] - pts[0][1]
-                mv  = math.sqrt(dx*dx + dy*dy)
+                mv  = math.sqrt(dx * dx + dy * dy)
                 if mv >= MIN_MOVE_PX:
-                    vx, vy = dx/mv, dy/mv
+                    vx, vy = dx / mv, dy / mv
 
-                    # Определяем ВСЕ road_zones, в которые попадает ТС
-                    vehicle_zones = []
-                    for zi, zone in enumerate(road_zones):
-                        if _point_in_zone(cx, cy, zone):
-                            vehicle_zones.append(zi)
-                    # Фоллбэк: ТС вне всех зон — берём ближайшую по центроиду
-                    if not vehicle_zones and road_zones:
-                        min_zd, nearest_z = float('inf'), 0
-                        for zi, zone in enumerate(road_zones):
-                            zx = sum(p[0] for p in zone) / len(zone)
-                            zy = sum(p[1] for p in zone) / len(zone)
-                            d  = math.sqrt((cx - zx)**2 + (cy - zy)**2)
-                            if d < min_zd:
-                                min_zd    = d
-                                nearest_z = zi
-                        vehicle_zones = [nearest_z]
+                    # Собираем допустимые направления: road_zones[i] → lane_lines[i]
+                    valid_dirs = []
+                    for i, zone in enumerate(road_zones):
+                        if _point_in_zone(cx, cy, zone) and i < len(lane_dirs) and lane_dirs[i] is not None:
+                            valid_dirs.append(lane_dirs[i])
 
-                    # Собираем стрелки для всех зон, в которых находится ТС
-                    if road_zones:
-                        vz_set        = set(vehicle_zones)
-                        target_arrows = [ld for ld in lane_dirs if ld["zone"] in vz_set]
-                        if not target_arrows:
-                            target_arrows = lane_dirs   # зональных стрелок нет — фоллбэк
-                    else:
-                        target_arrows = lane_dirs
+                    # Машина вне всех зон — проверяем по всем направлениям
+                    if not valid_dirs:
+                        valid_dirs = all_valid_dirs
 
-                    is_violation = False
-                    if len(vehicle_zones) > 1:
-                        # Перекрывающиеся зоны (перекрёсток / развязка):
-                        # движение разрешено, если направление ТС совпадает
-                        # хотя бы с одной стрелкой из любой из перекрывающихся зон.
-                        is_violation = not any(
-                            vx * ld["dir"][0] + vy * ld["dir"][1] >= DOT_THRESH
-                            for ld in target_arrows
-                        )
-                    else:
-                        # Одна зона — «своя» полоса определяется по минимальному
-                        # перпендикулярному расстоянию от ТС до линии стрелки.
-                        best_dot  = 1.0
-                        best_perp = float('inf')
-                        for ld in target_arrows:
-                            ddx, ddy = ld["dir"]
-                            perp = abs(-ddy * (cx - ld["mx"]) + ddx * (cy - ld["my"]))
-                            if perp < best_perp:
-                                best_perp = perp
-                                best_dot  = vx*ddx + vy*ddy
-                        is_violation = best_dot < DOT_THRESH
-
-                    if is_violation:
+                    # Нарушение: движение не совпадает ни с одним допустимым направлением
+                    if not any(vx * d[0] + vy * d[1] >= DOT_THRESH for d in valid_dirs):
                         active_viol[tid] = frame_num + VIOL_EXPIRE
 
             if active_viol.get(tid, -1) >= frame_num:
                 violations.append({"box": tuple(map(int, box)), "track_id": tid})
 
-    # ── Очистка историй пропавших треков ─────────────────────────────────────────
     for tid in list(track_pos.keys()):
         if tid not in current_ids:
             if frame_num - last_seen.get(tid, 0) > STALE_AFTER:
                 del track_pos[tid]
                 last_seen.pop(tid, None)
 
-    # ── Очистка истёкших нарушений ────────────────────────────────────────────────
     for tid, exp in list(active_viol.items()):
         if exp < frame_num:
             del active_viol[tid]
